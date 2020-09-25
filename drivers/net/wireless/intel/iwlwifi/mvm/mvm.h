@@ -27,6 +27,7 @@
 #include "sta.h"
 #include "fw-api.h"
 #include "constants.h"
+#include "iwl-vendor-cmd.h"
 #include "fw/runtime.h"
 #include "fw/dbg.h"
 #include "fw/acpi.h"
@@ -2021,6 +2022,7 @@ struct ieee80211_vif *iwl_mvm_get_bss_vif(struct iwl_mvm *mvm);
 struct ieee80211_vif *iwl_mvm_get_vif_by_macid(struct iwl_mvm *mvm, u32 macid);
 bool iwl_mvm_is_vif_assoc(struct iwl_mvm *mvm);
 
+void iwl_mvm_set_wiphy_vendor_commands(struct wiphy *wiphy);
 #define MVM_TCM_PERIOD_MSEC 500
 #define MVM_TCM_PERIOD (HZ * MVM_TCM_PERIOD_MSEC / 1000)
 #define MVM_LL_PERIOD (10 * HZ)

@@ -719,6 +719,8 @@ int iwl_mvm_mac_setup_register(struct iwl_mvm *mvm)
 	hw->wiphy->available_antennas_tx = iwl_mvm_get_valid_tx_ant(mvm);
 	hw->wiphy->available_antennas_rx = iwl_mvm_get_valid_rx_ant(mvm);
 
+	iwl_mvm_set_wiphy_vendor_commands(hw->wiphy);
+
 	ret = ieee80211_register_hw(mvm->hw);
 	if (ret) {
 		iwl_mvm_leds_exit(mvm);
