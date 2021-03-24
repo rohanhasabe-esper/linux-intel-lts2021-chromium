@@ -5,6 +5,7 @@
  */
 
 #include <linux/debugobjects.h>
+#include <linux/delay.h>
 
 #include "gt/intel_context.h"
 #include "gt/intel_engine_heartbeat.h"
@@ -864,7 +865,8 @@ int i915_active_acquire_preallocate_barrier(struct i915_active *ref,
 
 	/* Wait until the previous preallocation is completed */
 	while (!llist_empty(&ref->preallocated_barriers))
-		cond_resched();
+		//cond_resched();
+		usleep_range(10, 50);
 
 	/*
 	 * Preallocate a node for each physical engine supporting the target
