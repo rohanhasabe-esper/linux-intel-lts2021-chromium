@@ -39,6 +39,10 @@
 #include <linux/string_helpers.h>
 #include <linux/vga_switcheroo.h>
 #include <linux/vt.h>
+#if IS_ENABLED(CONFIG_DRM_I915_MEMTRACK)
+#include <linux/pid.h>
+#endif
+
 
 #include <drm/drm_aperture.h>
 #include <drm/drm_atomic_helper.h>
@@ -1041,6 +1045,15 @@ static void i915_driver_postclose(struct drm_device *dev, struct drm_file *file)
 
 	i915_gem_context_close(file);
 	i915_drm_client_put(file_priv->client);
+
+#if IS_ENABLED(CONFIG_DRM_I915_MEMTRACK)
+	i915_gem_remove_sysfs_file_entry(dev, file);
+	put_pid(file_priv->tgid);
+#endif
+
+#if IS_ENABLED(CONFIG_DRM_I915_MEMTRACK)
+	kfree(file_priv->process_name);
+#endif
 
 	kfree_rcu(file_priv, rcu);
 

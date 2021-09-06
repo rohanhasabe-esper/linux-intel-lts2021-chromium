@@ -247,6 +247,15 @@ rebuild_st:
 	if (i915_gem_object_can_bypass_llc(obj))
 		obj->cache_dirty = true;
 
+#if IS_ENABLED(CONFIG_DRM_I915_MEMTRACK)
+	if (obj->has_backing_pages == 0) {
+		struct drm_i915_private *dev_priv = to_i915(obj->base.dev);
+
+		dev_priv->mm.phys_mem_total += obj->base.size;
+		obj->has_backing_pages = 1;
+	}
+#endif
+
 	__i915_gem_object_set_pages(obj, st, i915_sg_dma_sizes(st->sgl));
 
 	return 0;
@@ -283,6 +292,18 @@ shmem_truncate(struct drm_i915_gem_object *obj)
 	shmem_truncate_range(file_inode(obj->base.filp), 0, (loff_t)-1);
 	obj->mm.madv = __I915_MADV_PURGED;
 	obj->mm.pages = ERR_PTR(-EFAULT);
+#if IS_ENABLED(CONFIG_DRM_I915_MEMTRACK)
+	/*
+          * Mark the object as not having backing pages, as physical space
+          * returned back to kernel
+          */
+	if (obj->has_backing_pages == 1) {
+		struct drm_i915_private *dev_priv = to_i915(obj->base.dev);
+
+		dev_priv->mm.phys_mem_total -= obj->base.size;
+		obj->has_backing_pages = 0;
+	}
+#endif
 
 	return 0;
 }

@@ -22,6 +22,10 @@ struct drm_i915_file_private {
 		struct rcu_head rcu;
 	};
 
+#if IS_ENABLED(CONFIG_DRM_I915_MEMTRACK)
+	char *process_name;
+	struct pid *tgid;
+#endif
 	/** @proto_context_lock: Guards all struct i915_gem_proto_context
 	 * operations
 	 *
@@ -88,7 +92,9 @@ struct drm_i915_file_private {
 	struct xarray vm_xa;
 
 	unsigned int bsd_engine;
-
+#if IS_ENABLED(CONFIG_DRM_I915_MEMTRACK)
+	struct bin_attribute *obj_attr;
+#endif
 /*
  * Every context ban increments per client ban score. Also
  * hangs in short succession increments ban score. If ban threshold
