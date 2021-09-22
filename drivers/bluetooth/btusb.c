@@ -3835,16 +3835,15 @@ static int btusb_probe(struct usb_interface *intf,
 	if (id->driver_info & BTUSB_AMP) {
 		/* AMP controllers do not support SCO packets */
 		data->isoc = NULL;
+#if (!IS_ENABLED(CONFIG_BT_SCOHCI))
 	} else {
 		/* Interface orders are hardcoded in the specification */
 		data->isoc = usb_ifnum_to_if(data->udev, ifnum_base + 1);
 		data->isoc_ifnum = ifnum_base + 1;
 		hdev->wbs_pkt_len =
 			hci_packet_size_usb_alt[btusb_find_altsetting(data, 6) ?
-							6 :
-						btusb_find_altsetting(data, 3) ?
-							3 :
-							      1];
+			6 : btusb_find_altsetting(data, 3) ? 3 :1];
+#endif
 	}
 
 	if (IS_ENABLED(CONFIG_BT_HCIBTUSB_RTL) &&
