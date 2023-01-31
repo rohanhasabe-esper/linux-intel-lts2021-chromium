@@ -6,7 +6,7 @@
 #
 
 config PVPANIC
-	bool "pvpanic device support"
+	tristate "pvpanic device support"
 	help
 	  This option allows to select a specific pvpanic device driver.
 	  pvpanic is a paravirtualized device provided by QEMU; it lets

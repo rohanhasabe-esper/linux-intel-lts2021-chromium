@@ -16,7 +16,7 @@ config MTD_NAND_ECC
        select MTD_NAND_CORE
 
 config MTD_NAND_ECC_SW_HAMMING
-	bool "Software Hamming ECC engine"
+	tristate "Software Hamming ECC engine"
 	default y if MTD_RAW_NAND
 	select MTD_NAND_ECC
 	help
