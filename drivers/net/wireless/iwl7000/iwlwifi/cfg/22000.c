@@ -10,7 +10,8 @@
 #include "fw/api/txq.h"
 
 /* Highest firmware API version supported */
-#define IWL_22000_UCODE_API_MAX	74
+#define IWL_22000_UCODE_API_MAX	79
+#define IWL_22500_UCODE_API_MAX	77
 
 /* Lowest firmware API version supported */
 #define IWL_22000_UCODE_API_MIN	39
@@ -50,7 +51,13 @@
 #define IWL_MA_A_GF4_A_FW_PRE		"iwlwifi-ma-a0-gf4-a0-"
 #define IWL_MA_A_MR_A_FW_PRE		"iwlwifi-ma-a0-mr-a0-"
 #define IWL_MA_A_FM_A_FW_PRE		"iwlwifi-ma-a0-fm-a0-"
+#define IWL_MA_B_HR_B_FW_PRE		"iwlwifi-ma-b0-hr-b0-"
+#define IWL_MA_B_GF_A_FW_PRE		"iwlwifi-ma-b0-gf-a0-"
+#define IWL_MA_B_GF4_A_FW_PRE		"iwlwifi-ma-b0-gf4-a0-"
+#define IWL_MA_B_MR_A_FW_PRE		"iwlwifi-ma-b0-mr-a0-"
+#define IWL_MA_B_FM_A_FW_PRE		"iwlwifi-ma-b0-fm-a0-"
 #define IWL_SNJ_A_MR_A_FW_PRE		"iwlwifi-SoSnj-a0-mr-a0-"
+#define IWL_BZ_A_HR_A_FW_PRE		"iwlwifi-bz-a0-hr-b0-"
 #define IWL_BZ_A_HR_B_FW_PRE		"iwlwifi-bz-a0-hr-b0-"
 #define IWL_BZ_A_GF_A_FW_PRE		"iwlwifi-bz-a0-gf-a0-"
 #define IWL_BZ_A_GF4_A_FW_PRE		"iwlwifi-bz-a0-gf4-a0-"
@@ -69,7 +76,9 @@
 #define IWL_BNJ_B_GF_A_FW_PRE		"iwlwifi-BzBnj-b0-gf-a0-"
 #define IWL_BNJ_A_GF4_A_FW_PRE		"iwlwifi-BzBnj-a0-gf4-a0-"
 #define IWL_BNJ_B_GF4_A_FW_PRE		"iwlwifi-BzBnj-b0-gf4-a0-"
+#define IWL_BNJ_A_HR_A_FW_PRE		"iwlwifi-BzBnj-a0-hr-b0-"
 #define IWL_BNJ_A_HR_B_FW_PRE		"iwlwifi-BzBnj-a0-hr-b0-"
+#define IWL_BNJ_B_HR_A_FW_PRE		"iwlwifi-BzBnj-b0-hr-b0-"
 #define IWL_BNJ_B_HR_B_FW_PRE		"iwlwifi-BzBnj-b0-hr-b0-"
 #define IWL_BNJ_B_FM_B_FW_PRE		"iwlwifi-BzBnj-b0-fm-b0-"
 
@@ -116,8 +125,20 @@
 	IWL_MA_A_MR_A_FW_PRE __stringify(api) ".ucode"
 #define IWL_MA_A_FM_A_FW_MODULE_FIRMWARE(api)		\
 	IWL_MA_A_FM_A_FW_PRE __stringify(api) ".ucode"
+#define IWL_MA_B_HR_B_FW_MODULE_FIRMWARE(api)		\
+	IWL_MA_B_HR_B_FW_PRE __stringify(api) ".ucode"
+#define IWL_MA_B_GF_A_FW_MODULE_FIRMWARE(api)		\
+	IWL_MA_B_GF_A_FW_PRE __stringify(api) ".ucode"
+#define IWL_MA_B_GF4_A_FW_MODULE_FIRMWARE(api)		\
+	IWL_MA_B_GF4_A_FW_PRE __stringify(api) ".ucode"
+#define IWL_MA_B_MR_A_FW_MODULE_FIRMWARE(api) \
+	IWL_MA_B_MR_A_FW_PRE __stringify(api) ".ucode"
+#define IWL_MA_B_FM_A_FW_MODULE_FIRMWARE(api)		\
+	IWL_MA_B_FM_A_FW_PRE __stringify(api) ".ucode"
 #define IWL_SNJ_A_MR_A_MODULE_FIRMWARE(api) \
 	IWL_SNJ_A_MR_A_FW_PRE __stringify(api) ".ucode"
+#define IWL_BZ_A_HR_A_MODULE_FIRMWARE(api) \
+	IWL_BZ_A_HR_A_FW_PRE __stringify(api) ".ucode"
 #define IWL_BZ_A_HR_B_MODULE_FIRMWARE(api) \
 	IWL_BZ_A_HR_B_FW_PRE __stringify(api) ".ucode"
 #define IWL_BZ_A_GF_A_MODULE_FIRMWARE(api) \
@@ -127,17 +148,17 @@
 #define IWL_BZ_A_MR_A_MODULE_FIRMWARE(api) \
 	IWL_BZ_A_MR_A_FW_PRE __stringify(api) ".ucode"
 #define IWL_BZ_A_FM_A_MODULE_FIRMWARE(api) \
-		IWL_BZ_A_FM_A_FW_PRE __stringify(api) ".ucode"
+	IWL_BZ_A_FM_A_FW_PRE __stringify(api) ".ucode"
 #define IWL_BZ_A_FM4_A_MODULE_FIRMWARE(api) \
-		IWL_BZ_A_FM4_A_FW_PRE __stringify(api) ".ucode"
+	IWL_BZ_A_FM4_A_FW_PRE __stringify(api) ".ucode"
 #define IWL_BZ_A_FM_B_MODULE_FIRMWARE(api) \
-		IWL_BZ_A_FM_B_FW_PRE __stringify(api) ".ucode"
+	IWL_BZ_A_FM_B_FW_PRE __stringify(api) ".ucode"
 #define IWL_BZ_A_FM4_B_MODULE_FIRMWARE(api) \
-		IWL_BZ_A_FM4_B_FW_PRE __stringify(api) ".ucode"
+	IWL_BZ_A_FM4_B_FW_PRE __stringify(api) ".ucode"
 #define IWL_GL_A_FM_A_MODULE_FIRMWARE(api) \
-		IWL_GL_A_FM_A_FW_PRE __stringify(api) ".ucode"
+	IWL_GL_A_FM_A_FW_PRE __stringify(api) ".ucode"
 #define IWL_GL_B_FM_B_MODULE_FIRMWARE(api) \
-		IWL_GL_B_FM_B_FW_PRE __stringify(api) ".ucode"
+	IWL_GL_B_FM_B_FW_PRE __stringify(api) ".ucode"
 #define IWL_BNJ_A_FM_A_MODULE_FIRMWARE(api) \
 	IWL_BNJ_A_FM_A_FW_PRE __stringify(api) ".ucode"
 #define IWL_BNJ_A_FM4_A_MODULE_FIRMWARE(api) \
@@ -152,8 +173,12 @@
 	IWL_BNJ_A_GF4_A_FW_PRE __stringify(api) ".ucode"
 #define IWL_BNJ_B_GF4_A_MODULE_FIRMWARE(api) \
 	IWL_BNJ_B_GF4_A_FW_PRE __stringify(api) ".ucode"
+#define IWL_BNJ_A_HR_A_MODULE_FIRMWARE(api) \
+	IWL_BNJ_A_HR_A_FW_PRE __stringify(api) ".ucode"
 #define IWL_BNJ_A_HR_B_MODULE_FIRMWARE(api) \
 	IWL_BNJ_A_HR_B_FW_PRE __stringify(api) ".ucode"
+#define IWL_BNJ_B_HR_A_MODULE_FIRMWARE(api) \
+	IWL_BNJ_B_HR_A_FW_PRE __stringify(api) ".ucode"
 #define IWL_BNJ_B_HR_B_MODULE_FIRMWARE(api) \
 	IWL_BNJ_B_HR_B_FW_PRE __stringify(api) ".ucode"
 #define IWL_BNJ_B_FM_B_MODULE_FIRMWARE(api) \
@@ -206,7 +231,6 @@ static const struct iwl_ht_params iwl_gl_a_ht_params = {
 };
 
 #define IWL_DEVICE_22000_COMMON						\
-	.ucode_api_max = IWL_22000_UCODE_API_MAX,			\
 	.ucode_api_min = IWL_22000_UCODE_API_MIN,			\
 	.led_mode = IWL_LED_RF_STATE,					\
 	.nvm_hw_section_num = 10,					\
@@ -245,6 +269,7 @@ static const struct iwl_ht_params iwl_gl_a_ht_params = {
 
 #define IWL_DEVICE_22500						\
 	IWL_DEVICE_22000_COMMON,					\
+	.ucode_api_max = IWL_22500_UCODE_API_MAX,			\
 	.trans.device_family = IWL_DEVICE_FAMILY_22000,			\
 	.trans.base_params = &iwl_22000_base_params,			\
 	.gp2_reg_addr = 0xa02c68,					\
@@ -261,6 +286,7 @@ static const struct iwl_ht_params iwl_gl_a_ht_params = {
 
 #define IWL_DEVICE_AX210						\
 	IWL_DEVICE_22000_COMMON,					\
+	.ucode_api_max = IWL_22000_UCODE_API_MAX,			\
 	.trans.umac_prph_offset = 0x300000,				\
 	.trans.device_family = IWL_DEVICE_FAMILY_AX210,			\
 	.trans.base_params = &iwl_ax210_base_params,			\
@@ -304,7 +330,7 @@ static const struct iwl_ht_params iwl_gl_a_ht_params = {
 	.trans.gen2 = true,						\
 	.nvm_type = IWL_NVM_EXT,					\
 	.dbgc_supported = true,						\
-	.min_umac_error_event_table = 0x400000,				\
+	.min_umac_error_event_table = 0xD0000,				\
 	.d3_debug_data_base_addr = 0x401000,				\
 	.d3_debug_data_length = 60 * 1024,				\
 	.mon_smem_regs = {						\
@@ -890,6 +916,41 @@ const struct iwl_cfg iwl_cfg_ma_a0_ms_a0 = {
 	.num_rbds = IWL_NUM_RBDS_AX210_HE,
 };
 
+const struct iwl_cfg iwl_cfg_ma_b0_fm_a0 = {
+	.fw_name_pre = IWL_MA_B_FM_A_FW_PRE,
+	.uhb_supported = true,
+	IWL_DEVICE_AX210,
+	.num_rbds = IWL_NUM_RBDS_AX210_HE,
+};
+
+const struct iwl_cfg iwl_cfg_ma_b0_hr_b0 = {
+	.fw_name_pre = IWL_MA_B_HR_B_FW_PRE,
+	.uhb_supported = true,
+	IWL_DEVICE_AX210,
+	.num_rbds = IWL_NUM_RBDS_AX210_HE,
+};
+
+const struct iwl_cfg iwl_cfg_ma_b0_gf_a0 = {
+	.fw_name_pre = IWL_MA_B_GF_A_FW_PRE,
+	.uhb_supported = true,
+	IWL_DEVICE_AX210,
+	.num_rbds = IWL_NUM_RBDS_AX210_HE,
+};
+
+const struct iwl_cfg iwl_cfg_ma_b0_gf4_a0 = {
+	.fw_name_pre = IWL_MA_B_GF4_A_FW_PRE,
+	.uhb_supported = true,
+	IWL_DEVICE_AX210,
+	.num_rbds = IWL_NUM_RBDS_AX210_HE,
+};
+
+const struct iwl_cfg iwl_cfg_ma_b0_mr_a0 = {
+	.fw_name_pre = IWL_MA_B_MR_A_FW_PRE,
+	.uhb_supported = true,
+	IWL_DEVICE_AX210,
+	.num_rbds = IWL_NUM_RBDS_AX210_HE,
+};
+
 const struct iwl_cfg iwl_cfg_so_a0_ms_a0 = {
 	.fw_name_pre = IWL_SO_A_MR_A_FW_PRE,
 	.uhb_supported = false,
@@ -934,6 +995,14 @@ const struct iwl_cfg iwl_cfg_quz_a0_hr_b0 = {
 	 */
 	.max_tx_agg_size = IEEE80211_MAX_AMPDU_BUF_HT,
 	.num_rbds = IWL_NUM_RBDS_22000_HE,
+};
+
+const struct iwl_cfg iwl_cfg_bz_a0_hr_a0 = {
+	.fw_name_pre = IWL_BZ_A_HR_A_FW_PRE,
+	.uhb_supported = true,
+	IWL_DEVICE_BZ,
+	.features = IWL_TX_CSUM_NETIF_FLAGS_BZ | NETIF_F_RXCSUM,
+	.num_rbds = IWL_NUM_RBDS_AX210_HE,
 };
 
 const struct iwl_cfg iwl_cfg_bz_a0_hr_b0 = {
@@ -1080,8 +1149,24 @@ const struct iwl_cfg iwl_cfg_bnj_b0_gf4_a0 = {
 	.num_rbds = IWL_NUM_RBDS_AX210_HE,
 };
 
+const struct iwl_cfg iwl_cfg_bnj_a0_hr_a0 = {
+	.fw_name_pre = IWL_BNJ_A_HR_A_FW_PRE,
+	.uhb_supported = true,
+	IWL_DEVICE_BZ,
+	.features = IWL_TX_CSUM_NETIF_FLAGS | NETIF_F_RXCSUM,
+	.num_rbds = IWL_NUM_RBDS_AX210_HE,
+};
+
 const struct iwl_cfg iwl_cfg_bnj_a0_hr_b0 = {
 	.fw_name_pre = IWL_BNJ_A_HR_B_FW_PRE,
+	.uhb_supported = true,
+	IWL_DEVICE_BZ,
+	.features = IWL_TX_CSUM_NETIF_FLAGS | NETIF_F_RXCSUM,
+	.num_rbds = IWL_NUM_RBDS_AX210_HE,
+};
+
+const struct iwl_cfg iwl_cfg_bnj_b0_hr_a0 = {
+	.fw_name_pre = IWL_BNJ_B_HR_A_FW_PRE,
 	.uhb_supported = true,
 	IWL_DEVICE_BZ,
 	.features = IWL_TX_CSUM_NETIF_FLAGS | NETIF_F_RXCSUM,
@@ -1103,14 +1188,14 @@ const struct iwl_cfg iwl_cfg_bnj_b0_fm_b0 = {
 	.features = IWL_TX_CSUM_NETIF_FLAGS_BZ | NETIF_F_RXCSUM,
 	.num_rbds = IWL_NUM_RBDS_AX210_HE,
 };
-MODULE_FIRMWARE(IWL_QU_B_HR_B_MODULE_FIRMWARE(IWL_22000_UCODE_API_MAX));
-MODULE_FIRMWARE(IWL_QNJ_B_HR_B_MODULE_FIRMWARE(IWL_22000_UCODE_API_MAX));
-MODULE_FIRMWARE(IWL_QU_C_HR_B_MODULE_FIRMWARE(IWL_22000_UCODE_API_MAX));
-MODULE_FIRMWARE(IWL_QU_B_JF_B_MODULE_FIRMWARE(IWL_22000_UCODE_API_MAX));
-MODULE_FIRMWARE(IWL_QUZ_A_HR_B_MODULE_FIRMWARE(IWL_22000_UCODE_API_MAX));
-MODULE_FIRMWARE(IWL_QUZ_A_JF_B_MODULE_FIRMWARE(IWL_22000_UCODE_API_MAX));
-MODULE_FIRMWARE(IWL_QNJ_B_JF_B_MODULE_FIRMWARE(IWL_22000_UCODE_API_MAX));
-MODULE_FIRMWARE(IWL_CC_A_MODULE_FIRMWARE(IWL_22000_UCODE_API_MAX));
+MODULE_FIRMWARE(IWL_QU_B_HR_B_MODULE_FIRMWARE(IWL_22500_UCODE_API_MAX));
+MODULE_FIRMWARE(IWL_QNJ_B_HR_B_MODULE_FIRMWARE(IWL_22500_UCODE_API_MAX));
+MODULE_FIRMWARE(IWL_QU_C_HR_B_MODULE_FIRMWARE(IWL_22500_UCODE_API_MAX));
+MODULE_FIRMWARE(IWL_QU_B_JF_B_MODULE_FIRMWARE(IWL_22500_UCODE_API_MAX));
+MODULE_FIRMWARE(IWL_QUZ_A_HR_B_MODULE_FIRMWARE(IWL_22500_UCODE_API_MAX));
+MODULE_FIRMWARE(IWL_QUZ_A_JF_B_MODULE_FIRMWARE(IWL_22500_UCODE_API_MAX));
+MODULE_FIRMWARE(IWL_QNJ_B_JF_B_MODULE_FIRMWARE(IWL_22500_UCODE_API_MAX));
+MODULE_FIRMWARE(IWL_CC_A_MODULE_FIRMWARE(IWL_22500_UCODE_API_MAX));
 MODULE_FIRMWARE(IWL_SO_A_JF_B_MODULE_FIRMWARE(IWL_22000_UCODE_API_MAX));
 MODULE_FIRMWARE(IWL_SO_A_HR_B_MODULE_FIRMWARE(IWL_22000_UCODE_API_MAX));
 MODULE_FIRMWARE(IWL_SO_A_GF_A_MODULE_FIRMWARE(IWL_22000_UCODE_API_MAX));
@@ -1124,7 +1209,13 @@ MODULE_FIRMWARE(IWL_MA_A_GF_A_FW_MODULE_FIRMWARE(IWL_22000_UCODE_API_MAX));
 MODULE_FIRMWARE(IWL_MA_A_GF4_A_FW_MODULE_FIRMWARE(IWL_22000_UCODE_API_MAX));
 MODULE_FIRMWARE(IWL_MA_A_MR_A_FW_MODULE_FIRMWARE(IWL_22000_UCODE_API_MAX));
 MODULE_FIRMWARE(IWL_MA_A_FM_A_FW_MODULE_FIRMWARE(IWL_22000_UCODE_API_MAX));
+MODULE_FIRMWARE(IWL_MA_B_HR_B_FW_MODULE_FIRMWARE(IWL_22000_UCODE_API_MAX));
+MODULE_FIRMWARE(IWL_MA_B_GF_A_FW_MODULE_FIRMWARE(IWL_22000_UCODE_API_MAX));
+MODULE_FIRMWARE(IWL_MA_B_GF4_A_FW_MODULE_FIRMWARE(IWL_22000_UCODE_API_MAX));
+MODULE_FIRMWARE(IWL_MA_B_MR_A_FW_MODULE_FIRMWARE(IWL_22000_UCODE_API_MAX));
+MODULE_FIRMWARE(IWL_MA_B_FM_A_FW_MODULE_FIRMWARE(IWL_22000_UCODE_API_MAX));
 MODULE_FIRMWARE(IWL_SNJ_A_MR_A_MODULE_FIRMWARE(IWL_22000_UCODE_API_MAX));
+MODULE_FIRMWARE(IWL_BZ_A_HR_A_MODULE_FIRMWARE(IWL_22000_UCODE_API_MAX));
 MODULE_FIRMWARE(IWL_BZ_A_HR_B_MODULE_FIRMWARE(IWL_22000_UCODE_API_MAX));
 MODULE_FIRMWARE(IWL_BZ_A_GF_A_MODULE_FIRMWARE(IWL_22000_UCODE_API_MAX));
 MODULE_FIRMWARE(IWL_BZ_A_GF4_A_MODULE_FIRMWARE(IWL_22000_UCODE_API_MAX));
@@ -1140,6 +1231,7 @@ MODULE_FIRMWARE(IWL_BNJ_B_GF_A_MODULE_FIRMWARE(IWL_22000_UCODE_API_MAX));
 MODULE_FIRMWARE(IWL_BNJ_A_GF4_A_MODULE_FIRMWARE(IWL_22000_UCODE_API_MAX));
 MODULE_FIRMWARE(IWL_BNJ_B_GF4_A_MODULE_FIRMWARE(IWL_22000_UCODE_API_MAX));
 MODULE_FIRMWARE(IWL_BNJ_A_HR_B_MODULE_FIRMWARE(IWL_22000_UCODE_API_MAX));
+MODULE_FIRMWARE(IWL_BNJ_B_HR_A_MODULE_FIRMWARE(IWL_22000_UCODE_API_MAX));
 MODULE_FIRMWARE(IWL_BNJ_B_HR_B_MODULE_FIRMWARE(IWL_22000_UCODE_API_MAX));
 MODULE_FIRMWARE(IWL_BZ_A_FM4_A_MODULE_FIRMWARE(IWL_22000_UCODE_API_MAX));
 MODULE_FIRMWARE(IWL_BZ_A_FM4_B_MODULE_FIRMWARE(IWL_22000_UCODE_API_MAX));

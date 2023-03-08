@@ -1621,7 +1621,7 @@ static int skl_check_main_surface(struct intel_plane_state *plane_state)
 	u32 offset;
 	int ret;
 
-	if (w > max_width || w < min_width || h > max_height) {
+	if (w > max_width || w < min_width || h > max_height || h < 1) {
 		drm_dbg_kms(&dev_priv->drm,
 			    "requested Y/RGB source size %dx%d outside limits (min: %dx1 max: %dx%d)\n",
 			    w, h, min_width, max_width, max_height);
@@ -1929,7 +1929,7 @@ static enum intel_fbc_id skl_fbc_id_for_pipe(enum pipe pipe)
 static bool skl_plane_has_fbc(struct drm_i915_private *dev_priv,
 			      enum intel_fbc_id fbc_id, enum plane_id plane_id)
 {
-	if ((INTEL_INFO(dev_priv)->display.fbc_mask & BIT(fbc_id)) == 0)
+	if ((RUNTIME_INFO(dev_priv)->fbc_mask & BIT(fbc_id)) == 0)
 		return false;
 
 	return plane_id == PLANE_PRIMARY;

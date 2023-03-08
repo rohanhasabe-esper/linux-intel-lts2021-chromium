@@ -1873,7 +1873,7 @@ int intel_guc_submission_init(struct intel_guc *guc)
 	if (guc->submission_initialized)
 		return 0;
 
-	if (guc->fw.major_ver_found < 70) {
+	if (GET_UC_VER(guc) < MAKE_UC_VER(70, 0, 0)) {
 		ret = guc_lrc_desc_pool_create_v69(guc);
 		if (ret)
 			return ret;
@@ -2308,7 +2308,7 @@ static int register_context(struct intel_context *ce, bool loop)
 	GEM_BUG_ON(intel_context_is_child(ce));
 	trace_intel_context_register(ce);
 
-	if (guc->fw.major_ver_found >= 70)
+	if (GET_UC_VER(guc) >= MAKE_UC_VER(70, 0, 0))
 		ret = register_context_v70(guc, ce, loop);
 	else
 		ret = register_context_v69(guc, ce, loop);
@@ -2320,7 +2320,7 @@ static int register_context(struct intel_context *ce, bool loop)
 		set_context_registered(ce);
 		spin_unlock_irqrestore(&ce->guc_state.lock, flags);
 
-		if (guc->fw.major_ver_found >= 70)
+		if (GET_UC_VER(guc) >= MAKE_UC_VER(70, 0, 0))
 			guc_context_policy_init_v70(ce, loop);
 	}
 
@@ -2430,6 +2430,10 @@ static int guc_context_policy_init_v70(struct intel_context *ce, bool loop)
 	int ret;
 
 	/* NB: For both of these, zero means disabled. */
+	GEM_BUG_ON(overflows_type(engine->props.timeslice_duration_ms * 1000,
+				  execution_quantum));
+	GEM_BUG_ON(overflows_type(engine->props.preempt_timeout_ms * 1000,
+				  preemption_timeout));
 	execution_quantum = engine->props.timeslice_duration_ms * 1000;
 	preemption_timeout = engine->props.preempt_timeout_ms * 1000;
 
@@ -2486,6 +2490,10 @@ static void guc_context_policy_init_v69(struct intel_engine_cs *engine,
 		desc->policy_flags |= CONTEXT_POLICY_FLAG_PREEMPT_TO_IDLE_V69;
 
 	/* NB: For both of these, zero means disabled. */
+	GEM_BUG_ON(overflows_type(engine->props.timeslice_duration_ms * 1000,
+				  desc->execution_quantum));
+	GEM_BUG_ON(overflows_type(engine->props.preempt_timeout_ms * 1000,
+				  desc->preemption_timeout));
 	desc->execution_quantum = engine->props.timeslice_duration_ms * 1000;
 	desc->preemption_timeout = engine->props.preempt_timeout_ms * 1000;
 }
@@ -2950,7 +2958,7 @@ static void __guc_context_set_preemption_timeout(struct intel_guc *guc,
 						 u16 guc_id,
 						 u32 preemption_timeout)
 {
-	if (guc->fw.major_ver_found >= 70) {
+	if (GET_UC_VER(guc) >= MAKE_UC_VER(70, 0, 0)) {
 		struct context_policy policy;
 
 		__guc_context_policy_start_klv(&policy, guc_id);
@@ -3215,7 +3223,7 @@ static int guc_context_alloc(struct intel_context *ce)
 static void __guc_context_set_prio(struct intel_guc *guc,
 				   struct intel_context *ce)
 {
-	if (guc->fw.major_ver_found >= 70) {
+	if (GET_UC_VER(guc) >= MAKE_UC_VER(70, 0, 0)) {
 		struct context_policy policy;
 
 		__guc_context_policy_start_klv(&policy, ce->guc_id.id);
@@ -4589,6 +4597,8 @@ void intel_guc_find_hung_context(struct intel_engine_cs *engine)
 
 	xa_lock_irqsave(&guc->context_lookup, flags);
 	xa_for_each(&guc->context_lookup, index, ce) {
+		bool found;
+
 		if (!kref_get_unless_zero(&ce->ref))
 			continue;
 
@@ -4605,10 +4615,18 @@ void intel_guc_find_hung_context(struct intel_engine_cs *engine)
 				goto next;
 		}
 
+		found = false;
+		spin_lock(&ce->guc_state.lock);
 		list_for_each_entry(rq, &ce->guc_state.requests, sched.link) {
 			if (i915_test_request_state(rq) != I915_REQUEST_ACTIVE)
 				continue;
 
+			found = true;
+			break;
+		}
+		spin_unlock(&ce->guc_state.lock);
+
+		if (found) {
 			intel_engine_set_hung_context(engine, ce);
 
 			/* Can only cope with one hang at a time... */

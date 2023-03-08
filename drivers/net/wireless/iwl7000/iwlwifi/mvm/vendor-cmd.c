@@ -29,7 +29,7 @@ static int iwl_mvm_netlink_notifier(struct notifier_block *nb,
 
 	spin_lock_bh(&device_list_lock);
 	list_for_each_entry(mvm, &device_list, list) {
-		if (mvm->csi_portid == netlink_notify_portid(notify))
+		if (mvm->csi_portid == notify->portid)
 			mvm->csi_portid = 0;
 	}
 	spin_unlock_bh(&device_list_lock);
@@ -1537,14 +1537,20 @@ static int iwl_mvm_vendor_add_pasn_sta(struct wiphy *wiphy,
 		return PTR_ERR(tb);
 
 	if (!tb[IWL_MVM_VENDOR_ATTR_ADDR] ||
-	    !tb[IWL_MVM_VENDOR_ATTR_STA_HLTK] ||
+	    (!tb[IWL_MVM_VENDOR_ATTR_STA_HLTK] &&
+	     !tb[IWL_MVM_VENDOR_ATTR_STA_TK]) ||
 	    !tb[IWL_MVM_VENDOR_ATTR_STA_CIPHER])
 		return -EINVAL;
 
 	addr = nla_data(tb[IWL_MVM_VENDOR_ATTR_ADDR]);
 	cipher = nla_get_u32(tb[IWL_MVM_VENDOR_ATTR_STA_CIPHER]);
-	hltk = nla_data(tb[IWL_MVM_VENDOR_ATTR_STA_HLTK]);
-	hltk_len = nla_len(tb[IWL_MVM_VENDOR_ATTR_STA_HLTK]);
+	if (tb[IWL_MVM_VENDOR_ATTR_STA_HLTK]) {
+		hltk = nla_data(tb[IWL_MVM_VENDOR_ATTR_STA_HLTK]);
+		hltk_len = nla_len(tb[IWL_MVM_VENDOR_ATTR_STA_HLTK]);
+	} else {
+		hltk = NULL;
+		hltk_len = 0;
+	}
 
 	rcu_read_lock();
 	sta = ieee80211_find_sta(vif, addr);

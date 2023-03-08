@@ -115,7 +115,6 @@ int dma_heap_bufferfd_alloc(struct dma_heap *heap, size_t len,
 		/* just return, as put will call release and that will free */
 	}
 	return fd;
-
 }
 EXPORT_SYMBOL_GPL(dma_heap_bufferfd_alloc);
 
@@ -363,13 +362,26 @@ struct dma_heap *dma_heap_add(const struct dma_heap_export_info *exp_info)
 	/* Make sure it doesn't disappear on us */
 	heap->heap_dev = get_device(heap->heap_dev);
 
-	/* Add heap to the list */
 	mutex_lock(&heap_list_lock);
+	/* check the name is unique */
+	list_for_each_entry(h, &heap_list, list) {
+		if (!strcmp(h->name, exp_info->name)) {
+			mutex_unlock(&heap_list_lock);
+			pr_err("dma_heap: Already registered heap named %s\n",
+			       exp_info->name);
+			err_ret = ERR_PTR(-EINVAL);
+			goto err3;
+		}
+	}
+
+	/* Add heap to the list */
 	list_add(&heap->list, &heap_list);
 	mutex_unlock(&heap_list_lock);
 
 	return heap;
 
+err3:
+	device_destroy(dma_heap_class, heap->heap_devt);
 err2:
 	cdev_del(&heap->heap_cdev);
 err1:

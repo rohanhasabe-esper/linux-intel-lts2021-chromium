@@ -12,6 +12,7 @@
 #include <net/bluetooth/mgmt.h>
 
 #include "hci_request.h"
+#include "hci_codec.h"
 #include "hci_debugfs.h"
 #include "smp.h"
 #include "eir.h"
@@ -727,16 +728,12 @@ int hci_setup_ext_adv_instance_sync(struct hci_dev *hdev, u8 instance)
 
 	/* Updating parameters of an active instance will return a
 	 * Command Disallowed error, so we must first disable the
-	 * instance if it is active. This call may fail if the instance
-	 * has been removed from the controller.
+	 * instance if it is active.
 	 */
 	if (adv && !adv->pending) {
 		err = hci_disable_ext_adv_instance_sync(hdev, instance);
 		if (err)
-			bt_dev_dbg(hdev, "Error code %d while disabling \
-				   instance %d. Continue \
-				   re-registering the instance",
-				   err, instance);
+			return err;
 	}
 
 	flags = hci_adv_instance_flags(hdev, instance);
@@ -1076,6 +1073,18 @@ int hci_enable_advertising(struct hci_dev *hdev)
 	return hci_cmd_sync_queue(hdev, enable_advertising_sync, NULL, NULL);
 }
 
+/* This function requires the caller holds hdev->lock */
+static int hci_remove_adv(struct hci_dev *hdev, u8 instance, struct sock *sk)
+{
+	int err;
+
+	err = hci_remove_adv_instance(hdev, instance);
+	if (!err)
+		mgmt_advertising_removed(sk, hdev, instance);
+
+	return err;
+}
+
 int hci_remove_ext_adv_instance_sync(struct hci_dev *hdev, u8 instance,
 				     struct sock *sk)
 {
@@ -1083,6 +1092,14 @@ int hci_remove_ext_adv_instance_sync(struct hci_dev *hdev, u8 instance,
 
 	if (!ext_adv_capable(hdev))
 		return 0;
+
+	/* When adapter is off, remove adv without sending HCI commands */
+	if (!hdev_is_powered(hdev)) {
+		hci_dev_lock(hdev);
+		err = hci_remove_adv(hdev, instance, sk);
+		hci_dev_unlock(hdev);
+		return err;
+	}
 
 	err = hci_disable_ext_adv_instance_sync(hdev, instance);
 	if (err)
@@ -1225,12 +1242,31 @@ int hci_schedule_adv_instance_sync(struct hci_dev *hdev, u8 instance,
 	return hci_start_adv_sync(hdev, instance);
 }
 
+static void hci_remove_all_adv(struct hci_dev *hdev, struct sock *sk)
+{
+	struct adv_info *adv, *n;
+
+	hci_dev_lock(hdev);
+	list_for_each_entry_safe(adv, n, &hdev->adv_instances, list) {
+		u8 instance = adv->instance;
+
+		hci_remove_adv(hdev, instance, sk);
+	}
+	hci_dev_unlock(hdev);
+}
+
 static int hci_clear_adv_sets_sync(struct hci_dev *hdev, struct sock *sk)
 {
 	int err;
 
 	if (!ext_adv_capable(hdev))
 		return 0;
+
+	/* When adapter is off, remove adv without sending HCI commands */
+	if (!hdev_is_powered(hdev)) {
+		hci_remove_all_adv(hdev, sk);
+		return 0;
+	}
 
 	/* Disable instance 0x00 to disable all instances */
 	err = hci_disable_ext_adv_instance_sync(hdev, 0x00);
@@ -1257,14 +1293,11 @@ static int hci_clear_adv_sync(struct hci_dev *hdev, struct sock *sk, bool force)
 	/* Cleanup non-ext instances */
 	list_for_each_entry_safe(adv, n, &hdev->adv_instances, list) {
 		u8 instance = adv->instance;
-		int err;
 
 		if (!(force || adv->timeout))
 			continue;
 
-		err = hci_remove_adv_instance(hdev, instance);
-		if (!err)
-			mgmt_advertising_removed(sk, hdev, instance);
+		hci_remove_adv(hdev, instance, sk);
 	}
 
 	hci_dev_unlock(hdev);
@@ -1286,9 +1319,7 @@ static int hci_remove_adv_sync(struct hci_dev *hdev, u8 instance,
 	 */
 	hci_dev_lock(hdev);
 
-	err = hci_remove_adv_instance(hdev, instance);
-	if (!err)
-		mgmt_advertising_removed(sk, hdev, instance);
+	err = hci_remove_adv(hdev, instance, sk);
 
 	hci_dev_unlock(hdev);
 
@@ -2232,6 +2263,16 @@ int hci_update_passive_scan_sync(struct hci_dev *hdev)
 	}
 
 	return err;
+}
+
+static int update_scan_sync(struct hci_dev *hdev, void *data)
+{
+	return hci_update_scan_sync(hdev);
+}
+
+int hci_update_scan(struct hci_dev *hdev)
+{
+	return hci_cmd_sync_queue(hdev, update_scan_sync, NULL, NULL);
 }
 
 static int update_passive_scan_sync(struct hci_dev *hdev, void *data)
@@ -3640,11 +3681,12 @@ static int hci_set_event_mask_page_2_sync(struct hci_dev *hdev)
 /* Read local codec list if the HCI command is supported */
 static int hci_read_local_codecs_sync(struct hci_dev *hdev)
 {
-	if (!(hdev->commands[29] & 0x20))
-		return 0;
+	if (hdev->commands[45] & 0x04)
+		hci_read_supported_codecs_v2(hdev);
+	else if (hdev->commands[29] & 0x20)
+		hci_read_supported_codecs(hdev);
 
-	return __hci_cmd_sync_status(hdev, HCI_OP_READ_LOCAL_CODECS, 0, NULL,
-				     HCI_CMD_TIMEOUT);
+	return 0;
 }
 
 /* Read local pairing options if the HCI command is supported */
@@ -4531,9 +4573,27 @@ static int hci_disconnect_all_sync(struct hci_dev *hdev, u8 reason)
 	return 0;
 }
 
+static void hci_disable_all_adv(struct hci_dev *hdev)
+{
+	struct adv_info *adv, *n;
+
+	if (!ext_adv_capable(hdev))
+		return;
+
+	hci_dev_lock(hdev);
+
+	list_for_each_entry_safe(adv, n, &hdev->adv_instances, list)
+		adv->enabled = false;
+
+	hci_dev_clear_flag(hdev, HCI_LE_ADV);
+
+	hci_dev_unlock(hdev);
+}
+
 /* This function perform power off HCI command sequence as follows:
  *
- * Clear Advertising
+ * Disable Advertising Instances. Do not clear adv instances so advertising
+ * can be re-enabled on power on.
  * Stop Discovery
  * Disconnect all connections
  * hci_dev_close_sync
@@ -4552,6 +4612,8 @@ static int hci_power_off_sync(struct hci_dev *hdev)
 		if (err)
 			return err;
 	}
+
+	hci_disable_all_adv(hdev);
 
 	err = hci_stop_discovery_sync(hdev);
 	if (err)

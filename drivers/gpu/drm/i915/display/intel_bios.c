@@ -2171,7 +2171,7 @@ static u8 map_ddc_pin(struct drm_i915_private *i915, u8 vbt_pin)
 	const u8 *ddc_pin_map;
 	int n_entries;
 
-	if (IS_ALDERLAKE_P(i915)) {
+	if (HAS_PCH_MTP(i915) || IS_ALDERLAKE_P(i915)) {
 		ddc_pin_map = adlp_ddc_pin_map;
 		n_entries = ARRAY_SIZE(adlp_ddc_pin_map);
 	} else if (IS_ALDERLAKE_S(i915)) {
@@ -2427,7 +2427,7 @@ static enum port dvo_port_to_port(struct drm_i915_private *i915,
 		[PORT_TC4] = { DVO_PORT_HDMII, DVO_PORT_DPI, -1 },
 	};
 
-	if (DISPLAY_VER(i915) == 13)
+	if (DISPLAY_VER(i915) >= 13)
 		return __dvo_port_to_port(ARRAY_SIZE(xelpd_port_mapping),
 					  ARRAY_SIZE(xelpd_port_mapping[0]),
 					  xelpd_port_mapping,
@@ -2447,6 +2447,22 @@ static enum port dvo_port_to_port(struct drm_i915_private *i915,
 					  ARRAY_SIZE(port_mapping[0]),
 					  port_mapping,
 					  dvo_port);
+}
+
+static enum port
+dsi_dvo_port_to_port(struct drm_i915_private *i915, u8 dvo_port)
+{
+	switch (dvo_port) {
+	case DVO_PORT_MIPIA:
+		return PORT_A;
+	case DVO_PORT_MIPIC:
+		if (DISPLAY_VER(i915) >= 11)
+			return PORT_B;
+		else
+			return PORT_C;
+	default:
+		return PORT_NONE;
+	}
 }
 
 static int parse_bdb_230_dp_max_link_rate(const int vbt_max_link_rate)
@@ -3381,19 +3397,16 @@ bool intel_bios_is_dsi_present(struct drm_i915_private *i915,
 
 		dvo_port = child->dvo_port;
 
-		if (dvo_port == DVO_PORT_MIPIA ||
-		    (dvo_port == DVO_PORT_MIPIB && DISPLAY_VER(i915) >= 11) ||
-		    (dvo_port == DVO_PORT_MIPIC && DISPLAY_VER(i915) < 11)) {
-			if (port)
-				*port = dvo_port - DVO_PORT_MIPIA;
-			return true;
-		} else if (dvo_port == DVO_PORT_MIPIB ||
-			   dvo_port == DVO_PORT_MIPIC ||
-			   dvo_port == DVO_PORT_MIPID) {
+		if (dsi_dvo_port_to_port(i915, dvo_port) == PORT_NONE) {
 			drm_dbg_kms(&i915->drm,
 				    "VBT has unsupported DSI port %c\n",
 				    port_name(dvo_port - DVO_PORT_MIPIA));
+			continue;
 		}
+
+		if (port)
+			*port = dsi_dvo_port_to_port(i915, dvo_port);
+		return true;
 	}
 
 	return false;
@@ -3478,7 +3491,7 @@ bool intel_bios_get_dsc_params(struct intel_encoder *encoder,
 		if (!(child->device_type & DEVICE_TYPE_MIPI_OUTPUT))
 			continue;
 
-		if (child->dvo_port - DVO_PORT_MIPIA == encoder->port) {
+		if (dsi_dvo_port_to_port(i915, child->dvo_port) == encoder->port) {
 			if (!devdata->dsc)
 				return false;
 
@@ -3585,7 +3598,7 @@ enum aux_ch intel_bios_port_aux_ch(struct drm_i915_private *i915,
 			aux_ch = AUX_CH_C;
 		break;
 	case DP_AUX_D:
-		if (DISPLAY_VER(i915) == 13)
+		if (DISPLAY_VER(i915) >= 13)
 			aux_ch = AUX_CH_D_XELPD;
 		else if (IS_ALDERLAKE_S(i915))
 			aux_ch = AUX_CH_USBC3;
@@ -3595,7 +3608,7 @@ enum aux_ch intel_bios_port_aux_ch(struct drm_i915_private *i915,
 			aux_ch = AUX_CH_D;
 		break;
 	case DP_AUX_E:
-		if (DISPLAY_VER(i915) == 13)
+		if (DISPLAY_VER(i915) >= 13)
 			aux_ch = AUX_CH_E_XELPD;
 		else if (IS_ALDERLAKE_S(i915))
 			aux_ch = AUX_CH_USBC4;
@@ -3603,25 +3616,25 @@ enum aux_ch intel_bios_port_aux_ch(struct drm_i915_private *i915,
 			aux_ch = AUX_CH_E;
 		break;
 	case DP_AUX_F:
-		if (DISPLAY_VER(i915) == 13)
+		if (DISPLAY_VER(i915) >= 13)
 			aux_ch = AUX_CH_USBC1;
 		else
 			aux_ch = AUX_CH_F;
 		break;
 	case DP_AUX_G:
-		if (DISPLAY_VER(i915) == 13)
+		if (DISPLAY_VER(i915) >= 13)
 			aux_ch = AUX_CH_USBC2;
 		else
 			aux_ch = AUX_CH_G;
 		break;
 	case DP_AUX_H:
-		if (DISPLAY_VER(i915) == 13)
+		if (DISPLAY_VER(i915) >= 13)
 			aux_ch = AUX_CH_USBC3;
 		else
 			aux_ch = AUX_CH_H;
 		break;
 	case DP_AUX_I:
-		if (DISPLAY_VER(i915) == 13)
+		if (DISPLAY_VER(i915) >= 13)
 			aux_ch = AUX_CH_USBC4;
 		else
 			aux_ch = AUX_CH_I;

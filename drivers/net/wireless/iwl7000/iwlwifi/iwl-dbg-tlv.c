@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause
 /*
- * Copyright (C) 2018-2022 Intel Corporation
+ * Copyright (C) 2018-2023 Intel Corporation
  */
 #include <linux/firmware.h>
 #include "iwl-drv.h"
@@ -138,6 +138,12 @@ static int iwl_dbg_tlv_alloc_buf_alloc(struct iwl_trans *trans,
 	    alloc_id != IWL_FW_INI_ALLOCATION_ID_DBGC1)
 		goto err;
 
+	if (buf_location == IWL_FW_INI_LOCATION_DRAM_PATH &&
+	    alloc->req_size == 0) {
+		IWL_ERR(trans, "WRT: Invalid DRAM buffer allocation requested size (0)\n");
+		return -EINVAL;
+	}
+
 	trans->dbg.fw_mon_cfg[alloc_id] = *alloc;
 
 	return 0;
@@ -216,7 +222,7 @@ static int iwl_dbg_tlv_alloc_region(struct iwl_trans *trans,
 	if (type == IWL_FW_INI_REGION_DEVICE_MEMORY &&
 	    reg->sub_type == IWL_FW_INI_REGION_DEVICE_MEMORY_SUBTYPE_HW_SMEM) {
 		IWL_DEBUG_FW(trans, "WRT: skipping HW-SMEM region\n");
-		return -EOPNOTSUPP;
+		return 0;
 	}
 #endif
 	if (type == IWL_FW_INI_REGION_INTERNAL_BUFFER) {
@@ -386,7 +392,7 @@ void iwl_dbg_tlv_del_timers(struct iwl_trans *trans)
 	struct iwl_dbg_tlv_timer_node *node, *tmp;
 
 	list_for_each_entry_safe(node, tmp, timer_list, list) {
-		del_timer_sync(&node->timer);
+		timer_shutdown_sync(&node->timer);
 		list_del(&node->list);
 		kfree(node);
 	}
@@ -747,7 +753,8 @@ static int iwl_dbg_tlv_update_dram(struct iwl_fw_runtime *fwrt,
 
 	if (le32_to_cpu(fwrt->trans->dbg.fw_mon_cfg[alloc_id].buf_location) !=
 			IWL_FW_INI_LOCATION_DRAM_PATH) {
-		IWL_DEBUG_FW(fwrt, "DRAM_PATH is not supported alloc_id %u\n", alloc_id);
+		IWL_DEBUG_FW(fwrt, "WRT: alloc_id %u location is not in DRAM_PATH\n",
+			     alloc_id);
 		return -1;
 	}
 
@@ -803,25 +810,27 @@ static void iwl_dbg_tlv_update_drams(struct iwl_fw_runtime *fwrt)
 			 IWL_UCODE_TLV_CAPA_DRAM_FRAG_SUPPORT))
 		return;
 
-	dram_info->first_word = cpu_to_le32(DRAM_INFO_FIRST_MAGIC_WORD);
-	dram_info->second_word = cpu_to_le32(DRAM_INFO_SECOND_MAGIC_WORD);
+	memset(dram_info, 0, sizeof(*dram_info));
 
 	for (i = IWL_FW_INI_ALLOCATION_ID_DBGC1;
 	     i < IWL_FW_INI_ALLOCATION_NUM; i++) {
+		if (fwrt->trans->dbg.fw_mon_cfg[i].buf_location ==
+				IWL_FW_INI_LOCATION_INVALID)
+			continue;
+
 		ret = iwl_dbg_tlv_update_dram(fwrt, i, dram_info);
 		if (!ret)
 			dram_alloc = true;
 		else
-			IWL_WARN(fwrt,
+			IWL_INFO(fwrt,
 				 "WRT: Failed to set DRAM buffer for alloc id %d, ret=%d\n",
 				 i, ret);
 	}
 
-	if (dram_alloc)
-		IWL_DEBUG_FW(fwrt, "block data after  %08x\n",
-			     dram_info->first_word);
-	else
-		memset(frags->block, 0, sizeof(*dram_info));
+	if (dram_alloc) {
+		dram_info->first_word = cpu_to_le32(DRAM_INFO_FIRST_MAGIC_WORD);
+		dram_info->second_word = cpu_to_le32(DRAM_INFO_SECOND_MAGIC_WORD);
+	}
 }
 
 static void iwl_dbg_tlv_send_hcmds(struct iwl_fw_runtime *fwrt,
