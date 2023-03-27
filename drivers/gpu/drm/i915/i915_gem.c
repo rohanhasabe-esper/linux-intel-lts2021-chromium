@@ -2127,9 +2127,7 @@ out_free_name:
 	kfree(file_priv->process_name);
 out_free_file:
 	put_pid(file_priv->tgid);
-	kfree(file_priv);
 #endif
-
 err_context:
 	i915_drm_client_put(client);
 err_client:
