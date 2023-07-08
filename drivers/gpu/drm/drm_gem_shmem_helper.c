@@ -576,12 +576,20 @@ static void drm_gem_shmem_vm_open(struct vm_area_struct *vma)
 {
 	struct drm_gem_object *obj = vma->vm_private_data;
 	struct drm_gem_shmem_object *shmem = to_drm_gem_shmem_obj(obj);
-	int ret;
 
 	WARN_ON(shmem->base.import_attach);
 
-	ret = drm_gem_shmem_get_pages(shmem);
-	WARN_ON_ONCE(ret != 0);
+	mutex_lock(&shmem->pages_lock);
+
+	/*
+	 * We should have already pinned the pages when the buffer was first
+	 * mmap'd, vm_open() just grabs an additional reference for the new
+	 * mm the vma is getting copied into (ie. on fork()).
+	 */
+	if (!WARN_ON_ONCE(!shmem->pages_use_count))
+		shmem->pages_use_count++;
+
+	mutex_unlock(&shmem->pages_lock);
 
 	drm_gem_vm_open(vma);
 }
@@ -619,20 +627,21 @@ int drm_gem_shmem_mmap(struct drm_gem_object *obj, struct vm_area_struct *vma)
 	int ret;
 
 	if (obj->import_attach) {
-		/* Drop the reference drm_gem_mmap_obj() acquired.*/
-		drm_gem_object_put(obj);
 		vma->vm_private_data = NULL;
+		ret = dma_buf_mmap(obj->dma_buf, vma, 0);
 
-		return dma_buf_mmap(obj->dma_buf, vma, 0);
+		/* Drop the reference drm_gem_mmap_obj() acquired.*/
+		if (!ret)
+			drm_gem_object_put(obj);
+
+		return ret;
 	}
 
 	shmem = to_drm_gem_shmem_obj(obj);
 
 	ret = drm_gem_shmem_get_pages(shmem);
-	if (ret) {
-		drm_gem_vm_close(vma);
+	if (ret)
 		return ret;
-	}
 
 	vma->vm_flags |= VM_PFNMAP | VM_DONTEXPAND | VM_DONTDUMP;
 	vma->vm_page_prot = vm_get_page_prot(vma->vm_flags);
@@ -672,7 +681,7 @@ EXPORT_SYMBOL(drm_gem_shmem_print_info);
  * drm_gem_shmem_get_pages_sgt() instead.
  *
  * Returns:
- * A pointer to the scatter/gather table of pinned pages or NULL on failure.
+ * A pointer to the scatter/gather table of pinned pages or error pointer on failure.
  */
 struct sg_table *drm_gem_shmem_get_sg_table(struct drm_gem_object *obj)
 {
@@ -683,6 +692,43 @@ struct sg_table *drm_gem_shmem_get_sg_table(struct drm_gem_object *obj)
 	return drm_prime_pages_to_sg(obj->dev, shmem->pages, obj->size >> PAGE_SHIFT);
 }
 EXPORT_SYMBOL_GPL(drm_gem_shmem_get_sg_table);
+
+static struct sg_table *drm_gem_shmem_get_pages_sgt_locked(struct drm_gem_object *obj)
+{
+	int ret;
+	struct drm_gem_shmem_object *shmem = to_drm_gem_shmem_obj(obj);
+	struct sg_table *sgt;
+
+	if (shmem->sgt)
+		return shmem->sgt;
+
+	WARN_ON(obj->import_attach);
+
+	ret = drm_gem_shmem_get_pages_locked(shmem);
+	if (ret)
+		return ERR_PTR(ret);
+
+	sgt = drm_gem_shmem_get_sg_table(&shmem->base);
+	if (IS_ERR(sgt)) {
+		ret = PTR_ERR(sgt);
+		goto err_put_pages;
+	}
+	/* Map the pages for use by the h/w. */
+	ret = dma_map_sgtable(obj->dev->dev, sgt, DMA_BIDIRECTIONAL, 0);
+	if (ret)
+		goto err_free_sgt;
+
+	shmem->sgt = sgt;
+
+	return sgt;
+
+err_free_sgt:
+	sg_free_table(sgt);
+	kfree(sgt);
+err_put_pages:
+	drm_gem_shmem_put_pages_locked(shmem);
+	return ERR_PTR(ret);
+}
 
 /**
  * drm_gem_shmem_get_pages_sgt - Pin pages, dma map them, and return a
@@ -706,35 +752,13 @@ struct sg_table *drm_gem_shmem_get_pages_sgt(struct drm_gem_object *obj)
 	struct drm_gem_shmem_object *shmem = to_drm_gem_shmem_obj(obj);
 	struct sg_table *sgt;
 
-	if (shmem->sgt)
-		return shmem->sgt;
-
-	WARN_ON(obj->import_attach);
-
-	ret = drm_gem_shmem_get_pages(shmem);
+	ret = mutex_lock_interruptible(&shmem->pages_lock);
 	if (ret)
 		return ERR_PTR(ret);
-
-	sgt = drm_gem_shmem_get_sg_table(&shmem->base);
-	if (IS_ERR(sgt)) {
-		ret = PTR_ERR(sgt);
-		goto err_put_pages;
-	}
-	/* Map the pages for use by the h/w. */
-	ret = dma_map_sgtable(obj->dev->dev, sgt, DMA_BIDIRECTIONAL, 0);
-	if (ret)
-		goto err_free_sgt;
-
-	shmem->sgt = sgt;
+	sgt = drm_gem_shmem_get_pages_sgt_locked(obj);
+	mutex_unlock(&shmem->pages_lock);
 
 	return sgt;
-
-err_free_sgt:
-	sg_free_table(sgt);
-	kfree(sgt);
-err_put_pages:
-	drm_gem_shmem_put_pages(shmem);
-	return ERR_PTR(ret);
 }
 EXPORT_SYMBOL_GPL(drm_gem_shmem_get_pages_sgt);
 

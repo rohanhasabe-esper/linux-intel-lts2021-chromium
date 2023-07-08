@@ -107,7 +107,6 @@ struct venus_format {
  * @vcodec1_clks: an array of vcodec1 struct clk pointers
  * @video_path: an interconnect handle to video to/from memory path
  * @cpucfg_path: an interconnect handle to cpu configuration path
- * @opp_table: an device OPP table handle
  * @has_opp_table: does OPP table exist
  * @pmdomains:	an array of pmdomains struct device pointers
  * @opp_dl_venus: an device-link for device OPP
@@ -129,6 +128,7 @@ struct venus_format {
  * @done:	a completion for sync HFI operations
  * @error:	an error returned during last HFI sync operations
  * @sys_error:	an error flag that signal system error event
+ * @sys_err_done: a waitqueue to wait for system error recovery end
  * @core_ops:	the core operations
  * @pm_ops:	a pointer to pm operations
  * @pm_lock:	a lock for PM operations
@@ -262,6 +262,7 @@ struct venc_controls {
 
 	u32 header_mode;
 	bool aud_enable;
+	u32 intra_refresh_type;
 	u32 intra_refresh_period;
 
 	struct {
@@ -356,6 +357,7 @@ enum venus_inst_modes {
  * @width:	current capture width
  * @height:	current capture height
  * @crop:	current crop rectangle
+ * @fw_min_cnt:	 firmware minimum buffer count
  * @out_width:	current output width
  * @out_height:	current output height
  * @colorspace:	current color space
@@ -387,6 +389,7 @@ enum venus_inst_modes {
  * @sequence_out:	a sequence counter for output queue
  * @m2m_dev:	a reference to m2m device structure
  * @m2m_ctx:	a reference to m2m context structure
+ * @ctx_q_lock:	a lock to serialize video device ioctl calls
  * @state:	current state of the instance
  * @done:	a completion for sync HFI operation
  * @error:	an error returned during last HFI sync operation
@@ -400,6 +403,8 @@ enum venus_inst_modes {
  * @pic_struct:		bitstream progressive vs interlaced
  * @next_buf_last: a flag to mark next queued capture buffer as last
  * @drain_active:	Drain sequence is in progress
+ * @flags:	bitmask flags describing current instance mode
+ * @dpb_ids:	DPB buffer ID's
  */
 struct venus_inst {
 	struct list_head list;
@@ -456,6 +461,7 @@ struct venus_inst {
 	u32 sequence_out;
 	struct v4l2_m2m_dev *m2m_dev;
 	struct v4l2_m2m_ctx *m2m_ctx;
+	struct mutex ctx_q_lock;
 	unsigned int state;
 	struct completion done;
 	unsigned int error;

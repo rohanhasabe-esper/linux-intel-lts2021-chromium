@@ -466,6 +466,24 @@ allowing a system to set up (and later use) an image without it being
 altered.
 Generally used together with the `modules_disabled`_ sysctl.
 
+kexec_load_limit_panic
+======================
+
+This parameter specifies a limit to the number of times the syscalls
+``kexec_load`` and ``kexec_file_load`` can be called with a crash
+image. It can only be set with a more restrictive value than the
+current one.
+
+== ======================================================
+-1 Unlimited calls to kexec. This is the default setting.
+N  Number of calls left.
+== ======================================================
+
+kexec_load_limit_reboot
+=======================
+
+Similar functionality as ``kexec_load_limit_panic``, but for a normal
+image.
 
 kptr_restrict
 =============
@@ -680,6 +698,15 @@ This is the default behavior.
 
 1: Will non-maskably interrupt all CPUs and dump their backtraces when
 an oops event is detected.
+
+
+oops_limit
+==========
+
+Number of kernel oopses after which the kernel should panic when
+``panic_on_oops`` is not set. Setting this to 0 disables checking
+the count. Setting this to  1 has the same effect as setting
+``panic_on_oops=1``. The default value is 10000.
 
 
 osrelease, ostype & version
@@ -1506,6 +1533,16 @@ entry will default to 2 instead of 0.
 1 Unprivileged calls to ``bpf()`` are disabled without recovery
 2 Unprivileged calls to ``bpf()`` are disabled
 = =============================================================
+
+
+warn_limit
+==========
+
+Number of kernel warnings after which the kernel should panic when
+``panic_on_warn`` is not set. Setting this to 0 disables checking
+the warning count. Setting this to 1 has the same effect as setting
+``panic_on_warn=1``. The default value is 0.
+
 
 watchdog
 ========

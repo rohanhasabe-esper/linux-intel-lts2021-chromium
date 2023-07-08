@@ -54,6 +54,12 @@
 #include <linux/shmem_fs.h>
 #include <linux/ctype.h>
 #include <linux/debugfs.h>
+#include <linux/rculist_nulls.h>
+#include <linux/random.h>
+#include <linux/mmu_notifier.h>
+#ifdef CONFIG_KVM
+#include <linux/kvm_host.h>
+#endif
 
 #include <asm/tlbflush.h>
 #include <asm/div64.h>
@@ -132,13 +138,6 @@ struct scan_control {
 	/* Always discard instead of demoting to lower tier memory */
 	unsigned int no_demotion:1;
 
-#ifdef CONFIG_LRU_GEN
-	/* help make better choices when multiple memcgs are available */
-	unsigned int memcgs_need_aging:1;
-	unsigned int memcgs_need_swapping:1;
-	unsigned int memcgs_avoid_swapping:1;
-#endif
-
 	/* Allocation order */
 	s8 order;
 
@@ -189,6 +188,8 @@ struct scan_control {
  * From 0 .. 200.  Higher means more swappy.
  */
 int vm_swappiness = 60;
+
+struct kernfs_node *lru_gen_admin_node;
 
 static void set_task_reclaim_state(struct task_struct *task,
 				   struct reclaim_state *rs)
@@ -469,6 +470,11 @@ static bool cgroup_reclaim(struct scan_control *sc)
 	return sc->target_mem_cgroup;
 }
 
+static bool global_reclaim(struct scan_control *sc)
+{
+	return !sc->target_mem_cgroup || mem_cgroup_is_root(sc->target_mem_cgroup);
+}
+
 /**
  * writeback_throttling_sane - is the usual dirty throttling mechanism available?
  * @sc: scan_control in question
@@ -517,6 +523,11 @@ static long add_nr_deferred_memcg(long nr, int nid, struct shrinker *shrinker,
 static bool cgroup_reclaim(struct scan_control *sc)
 {
 	return false;
+}
+
+static bool global_reclaim(struct scan_control *sc)
+{
+	return true;
 }
 
 static bool writeback_throttling_sane(struct scan_control *sc)
@@ -1932,69 +1943,6 @@ unsigned int reclaim_clean_pages_from_list(struct zone *zone,
 }
 
 /*
- * Attempt to remove the specified page from its LRU.  Only take this page
- * if it is of the appropriate PageActive status.  Pages which are being
- * freed elsewhere are also ignored.
- *
- * page:	page to consider
- * mode:	one of the LRU isolation modes defined above
- *
- * returns true on success, false on failure.
- */
-bool __isolate_lru_page_prepare(struct page *page, isolate_mode_t mode)
-{
-	/* Only take pages on the LRU. */
-	if (!PageLRU(page))
-		return false;
-
-	/* Compaction should not handle unevictable pages but CMA can do so */
-	if (PageUnevictable(page) && !(mode & ISOLATE_UNEVICTABLE))
-		return false;
-
-	/*
-	 * To minimise LRU disruption, the caller can indicate that it only
-	 * wants to isolate pages it will be able to operate on without
-	 * blocking - clean pages for the most part.
-	 *
-	 * ISOLATE_ASYNC_MIGRATE is used to indicate that it only wants to pages
-	 * that it is possible to migrate without blocking
-	 */
-	if (mode & ISOLATE_ASYNC_MIGRATE) {
-		/* All the caller can do on PageWriteback is block */
-		if (PageWriteback(page))
-			return false;
-
-		if (PageDirty(page)) {
-			struct address_space *mapping;
-			bool migrate_dirty;
-
-			/*
-			 * Only pages without mappings or that have a
-			 * ->migratepage callback are possible to migrate
-			 * without blocking. However, we can be racing with
-			 * truncation so it's necessary to lock the page
-			 * to stabilise the mapping as truncation holds
-			 * the page lock until after the page is removed
-			 * from the page cache.
-			 */
-			if (!trylock_page(page))
-				return false;
-
-			mapping = page_mapping(page);
-			migrate_dirty = !mapping || mapping->a_ops->migratepage;
-			unlock_page(page);
-			if (!migrate_dirty)
-				return false;
-		}
-	}
-
-	if ((mode & ISOLATE_UNMAPPED) && page_mapped(page))
-		return false;
-
-	return true;
-}
-
-/*
  * Update LRU sizes after isolating pages. The LRU size updates must
  * be complete before mem_cgroup_update_lru_size due to a sanity check.
  */
@@ -2045,11 +1993,11 @@ static unsigned long isolate_lru_pages(unsigned long nr_to_scan,
 	unsigned long skipped = 0;
 	unsigned long scan, total_scan, nr_pages;
 	LIST_HEAD(pages_skipped);
-	isolate_mode_t mode = (sc->may_unmap ? 0 : ISOLATE_UNMAPPED);
 
 	total_scan = 0;
 	scan = 0;
 	while (scan < nr_to_scan && !list_empty(src)) {
+		struct list_head *move_to = src;
 		struct page *page;
 
 		page = lru_to_page(src);
@@ -2059,9 +2007,9 @@ static unsigned long isolate_lru_pages(unsigned long nr_to_scan,
 		total_scan += nr_pages;
 
 		if (page_zonenum(page) > sc->reclaim_idx) {
-			list_move(&page->lru, &pages_skipped);
 			nr_skipped[page_zonenum(page)] += nr_pages;
-			continue;
+			move_to = &pages_skipped;
+			goto move;
 		}
 
 		/*
@@ -2069,37 +2017,34 @@ static unsigned long isolate_lru_pages(unsigned long nr_to_scan,
 		 * return with no isolated pages if the LRU mostly contains
 		 * ineligible pages.  This causes the VM to not reclaim any
 		 * pages, triggering a premature OOM.
-		 *
-		 * Account all tail pages of THP.  This would not cause
-		 * premature OOM since __isolate_lru_page() returns -EBUSY
-		 * only when the page is being freed somewhere else.
+		 * Account all tail pages of THP.
 		 */
 		scan += nr_pages;
-		if (!__isolate_lru_page_prepare(page, mode)) {
-			/* It is being freed elsewhere */
-			list_move(&page->lru, src);
-			continue;
-		}
+
+		if (!PageLRU(page))
+			goto move;
+		if (!sc->may_unmap && page_mapped(page))
+			goto move;
+
 		/*
 		 * Be careful not to clear PageLRU until after we're
 		 * sure the page is not being freed elsewhere -- the
 		 * page release code relies on it.
 		 */
-		if (unlikely(!get_page_unless_zero(page))) {
-			list_move(&page->lru, src);
-			continue;
-		}
+		if (unlikely(!get_page_unless_zero(page)))
+			goto move;
 
 		if (!TestClearPageLRU(page)) {
 			/* Another thread is already isolating this page */
 			put_page(page);
-			list_move(&page->lru, src);
-			continue;
+			goto move;
 		}
 
 		nr_taken += nr_pages;
 		nr_zone_taken[page_zonenum(page)] += nr_pages;
-		list_move(&page->lru, dst);
+		move_to = dst;
+move:
+		list_move(&page->lru, move_to);
 	}
 
 	/*
@@ -2123,7 +2068,8 @@ static unsigned long isolate_lru_pages(unsigned long nr_to_scan,
 	}
 	*nr_scanned = total_scan;
 	trace_mm_vmscan_lru_isolate(sc->reclaim_idx, sc->order, nr_to_scan,
-				    total_scan, skipped, nr_taken, mode, lru);
+				    total_scan, skipped, nr_taken,
+				    sc->may_unmap ? 0 : ISOLATE_UNMAPPED, lru);
 	update_lru_sizes(lruvec, lru, nr_zone_taken);
 	return nr_taken;
 }
@@ -3025,32 +2971,8 @@ DEFINE_STATIC_KEY_ARRAY_FALSE(lru_gen_caps, NR_LRU_GEN_CAPS);
 		for ((type) = 0; (type) < ANON_AND_FILE; (type)++)	\
 			for ((zone) = 0; (zone) < MAX_NR_ZONES; (zone)++)
 
-static int page_lru_gen(struct page *page)
-{
-	unsigned long flags = READ_ONCE(page->flags);
-
-	return ((flags & LRU_GEN_MASK) >> LRU_GEN_PGOFF) - 1;
-}
-
-static int page_lru_tier(struct page *page)
-{
-	int refs;
-	unsigned long flags = READ_ONCE(page->flags);
-
-	refs = (flags & LRU_REFS_FLAGS) == LRU_REFS_FLAGS ?
-	       ((flags & LRU_REFS_MASK) >> LRU_REFS_PGOFF) + 1 : 0;
-
-	return lru_tier_from_refs(refs);
-}
-
-static bool get_cap(int cap)
-{
-#ifdef CONFIG_LRU_GEN_ENABLED
-	return static_branch_likely(&lru_gen_caps[cap]);
-#else
-	return static_branch_unlikely(&lru_gen_caps[cap]);
-#endif
-}
+#define get_memcg_gen(seq)	((seq) % MEMCG_NR_GENS)
+#define get_memcg_bin(bin)	((bin) % MEMCG_NR_BINS)
 
 static struct lruvec *get_lruvec(struct mem_cgroup *memcg, int nid)
 {
@@ -3077,6 +2999,9 @@ static int get_swappiness(struct lruvec *lruvec, struct scan_control *sc)
 	struct mem_cgroup *memcg = lruvec_memcg(lruvec);
 	struct pglist_data *pgdat = lruvec_pgdat(lruvec);
 
+	if (!sc->may_swap)
+		return 0;
+
 	if (!can_demote(pgdat->node_id, sc) &&
 	    mem_cgroup_get_nr_swap_pages(memcg) < MIN_LRU_BATCH)
 		return 0;
@@ -3091,7 +3016,7 @@ static int get_nr_gens(struct lruvec *lruvec, int type)
 
 static bool __maybe_unused seq_is_valid(struct lruvec *lruvec)
 {
-	/* see the comment on lru_gen_struct */
+	/* see the comment on lru_gen_page */
 	return get_nr_gens(lruvec, LRU_GEN_FILE) >= MIN_NR_GENS &&
 	       get_nr_gens(lruvec, LRU_GEN_FILE) <= get_nr_gens(lruvec, LRU_GEN_ANON) &&
 	       get_nr_gens(lruvec, LRU_GEN_ANON) <= MAX_NR_GENS;
@@ -3199,14 +3124,17 @@ void lru_gen_migrate_mm(struct mm_struct *mm)
 	if (mem_cgroup_disabled())
 		return;
 
+	/* migration can happen before addition */
+	if (!mm->lru_gen.memcg)
+		return;
+
 	rcu_read_lock();
 	memcg = mem_cgroup_from_task(mm->owner);
 	rcu_read_unlock();
 	if (memcg == mm->lru_gen.memcg)
 		return;
 
-	VM_BUG_ON_MM(!mm->lru_gen.memcg, mm);
-	VM_BUG_ON_MM(list_empty(&mm->lru_gen.list), mm);
+	VM_WARN_ON_ONCE(list_empty(&mm->lru_gen.list));
 
 	lru_gen_del_mm(mm);
 	lru_gen_add_mm(mm);
@@ -3503,7 +3431,7 @@ struct ctrl_pos {
 static void read_ctrl_pos(struct lruvec *lruvec, int type, int tier, int gain,
 			  struct ctrl_pos *pos)
 {
-	struct lru_gen_struct *lrugen = &lruvec->lrugen;
+	struct lru_gen_page *lrugen = &lruvec->lrugen;
 	int hist = lru_hist_from_seq(lrugen->min_seq[type]);
 
 	pos->refaulted = lrugen->avg_refaulted[type][tier] +
@@ -3518,7 +3446,7 @@ static void read_ctrl_pos(struct lruvec *lruvec, int type, int tier, int gain,
 static void reset_ctrl_pos(struct lruvec *lruvec, int type, bool carryover)
 {
 	int hist, tier;
-	struct lru_gen_struct *lrugen = &lruvec->lrugen;
+	struct lru_gen_page *lrugen = &lruvec->lrugen;
 	bool clear = carryover ? NR_HIST_GENS == 1 : NR_HIST_GENS > 1;
 	unsigned long seq = carryover ? lrugen->min_seq[type] : lrugen->max_seq + 1;
 
@@ -3597,7 +3525,7 @@ static int page_inc_gen(struct lruvec *lruvec, struct page *page, bool reclaimin
 {
 	unsigned long old_flags, new_flags;
 	int type = page_is_file_lru(page);
-	struct lru_gen_struct *lrugen = &lruvec->lrugen;
+	struct lru_gen_page *lrugen = &lruvec->lrugen;
 	int new_gen, old_gen = lru_gen_from_seq(lrugen->min_seq[type]);
 
 	do {
@@ -3643,7 +3571,7 @@ static void update_batch_size(struct lru_gen_mm_walk *walk, struct page *page,
 static void reset_batch_size(struct lruvec *lruvec, struct lru_gen_mm_walk *walk)
 {
 	int gen, type, zone;
-	struct lru_gen_struct *lrugen = &lruvec->lrugen;
+	struct lru_gen_page *lrugen = &lruvec->lrugen;
 
 	walk->batched = 0;
 
@@ -3670,9 +3598,19 @@ static int should_skip_vma(unsigned long start, unsigned long end, struct mm_wal
 	struct vm_area_struct *vma = walk->vma;
 	struct lru_gen_mm_walk *priv = walk->private;
 
-	if (!vma_is_accessible(vma) || is_vm_hugetlb_page(vma) ||
-	    (vma->vm_flags & (VM_LOCKED | VM_SPECIAL | VM_SEQ_READ | VM_RAND_READ)) ||
-	    vma == get_gate_vma(vma->vm_mm))
+	if (!vma_is_accessible(vma))
+		return true;
+
+	if (is_vm_hugetlb_page(vma))
+		return true;
+
+	if (!vma_has_recency(vma))
+		return true;
+
+	if (vma->vm_flags & (VM_LOCKED | VM_SPECIAL))
+		return true;
+
+	if (vma == get_gate_vma(vma->vm_mm))
 		return true;
 
 	if (vma_is_anonymous(vma))
@@ -3728,6 +3666,120 @@ static bool get_next_vma(struct mm_walk *walk, unsigned long mask, unsigned long
 	return false;
 }
 
+static unsigned long get_pte_pfn(pte_t pte, struct vm_area_struct *vma, unsigned long addr)
+{
+	unsigned long pfn = pte_pfn(pte);
+
+	VM_WARN_ON_ONCE(addr < vma->vm_start || addr >= vma->vm_end);
+
+	if (!pte_present(pte) || is_zero_pfn(pfn))
+		return -1;
+
+	if (WARN_ON_ONCE(pte_devmap(pte) || pte_special(pte)))
+		return -1;
+
+	if (WARN_ON_ONCE(!pfn_valid(pfn)))
+		return -1;
+
+	return pfn;
+}
+
+#if defined(CONFIG_TRANSPARENT_HUGEPAGE) || defined(CONFIG_ARCH_HAS_NONLEAF_PMD_YOUNG)
+static unsigned long get_pmd_pfn(pmd_t pmd, struct vm_area_struct *vma, unsigned long addr)
+{
+	unsigned long pfn = pmd_pfn(pmd);
+
+	VM_WARN_ON_ONCE(addr < vma->vm_start || addr >= vma->vm_end);
+
+	if (!pmd_present(pmd) || is_huge_zero_pmd(pmd))
+		return -1;
+
+	if (WARN_ON_ONCE(pmd_devmap(pmd)))
+		return -1;
+
+	if (WARN_ON_ONCE(!pfn_valid(pfn)))
+		return -1;
+
+	return pfn;
+}
+#endif
+
+static struct page *get_pfn_page(unsigned long pfn, struct mem_cgroup *memcg,
+				 struct pglist_data *pgdat, bool can_swap)
+{
+	struct page *page;
+
+	/* try to avoid unnecessary memory loads */
+	if (pfn < pgdat->node_start_pfn || pfn >= pgdat_end_pfn(pgdat))
+		return NULL;
+
+	page = compound_head(pfn_to_page(pfn));
+	if (page_to_nid(page) != pgdat->node_id)
+		return NULL;
+
+	if (page_memcg_rcu(page) != memcg)
+		return NULL;
+
+	/* file VMAs can contain anon pages from COW */
+	if (!page_is_file_lru(page) && !can_swap)
+		return NULL;
+
+	return page;
+}
+
+#ifndef kvm_arch_has_test_clear_young
+#define kvm_arch_has_test_clear_young() 0
+#endif
+
+static bool test_spte_young(struct mm_struct *mm, unsigned long addr, unsigned long end,
+			    unsigned long *bitmap, unsigned long *last)
+{
+	if (!kvm_arch_has_test_clear_young() || !get_cap(LRU_GEN_SPTE_WALK))
+		return false;
+
+	if (*last > addr)
+		goto done;
+
+	*last = end - addr > MIN_LRU_BATCH * PAGE_SIZE ?
+		addr + MIN_LRU_BATCH * PAGE_SIZE - 1 : end - 1;
+	bitmap_zero(bitmap, MIN_LRU_BATCH);
+
+	mmu_notifier_test_clear_young(mm, addr, *last + 1, false, bitmap);
+done:
+	return test_bit((*last - addr) / PAGE_SIZE, bitmap);
+}
+
+static void clear_spte_young(struct mm_struct *mm, unsigned long addr,
+			     unsigned long *bitmap, unsigned long *last)
+{
+	int i;
+	unsigned long start, end = *last + 1;
+
+	if (addr + PAGE_SIZE != end)
+		return;
+
+	i = find_last_bit(bitmap, MIN_LRU_BATCH);
+	if (i == MIN_LRU_BATCH)
+		return;
+
+	start = end - (i + 1) * PAGE_SIZE;
+
+	i = find_first_bit(bitmap, MIN_LRU_BATCH);
+
+	end -= i * PAGE_SIZE;
+
+	mmu_notifier_test_clear_young(mm, start, end, false, bitmap);
+}
+
+static void skip_spte_young(struct mm_struct *mm, unsigned long addr,
+			    unsigned long *bitmap, unsigned long *last)
+{
+	if (*last > addr)
+		__clear_bit((*last - addr) / PAGE_SIZE, bitmap);
+
+	clear_spte_young(mm, addr, bitmap, last);
+}
+
 static bool suitable_to_scan(int total, int young)
 {
 	int n = clamp_t(int, cache_line_size() / sizeof(pte_t), 2, 8);
@@ -3743,6 +3795,8 @@ static bool walk_pte_range(pmd_t *pmd, unsigned long start, unsigned long end,
 	pte_t *pte;
 	spinlock_t *ptl;
 	unsigned long addr;
+	unsigned long bitmap[BITS_TO_LONGS(MIN_LRU_BATCH)];
+	unsigned long last = 0;
 	int total = 0;
 	int young = 0;
 	struct lru_gen_mm_walk *priv = walk->private;
@@ -3761,6 +3815,7 @@ static bool walk_pte_range(pmd_t *pmd, unsigned long start, unsigned long end,
 	pte = pte_offset_map(pmd, start & PMD_MASK);
 restart:
 	for (i = pte_index(start), addr = start; addr != end; i++, addr += PAGE_SIZE) {
+		bool success;
 		struct page *page;
 		unsigned long pfn = pte_pfn(pte[i]);
 
@@ -3769,30 +3824,28 @@ restart:
 		total++;
 		priv->mm_stats[MM_PTE_TOTAL]++;
 
-		if (!pte_present(pte[i]) || is_zero_pfn(pfn))
-			continue;
-
-		if (WARN_ON_ONCE(pte_devmap(pte[i]) || pte_special(pte[i])))
-			continue;
-
-		if (!pte_young(pte[i])) {
-			priv->mm_stats[MM_PTE_OLD]++;
+		pfn = get_pte_pfn(pte[i], args->vma, addr);
+		if (pfn == -1) {
+			skip_spte_young(args->vma->vm_mm, addr, bitmap, &last);
 			continue;
 		}
 
-		VM_BUG_ON(!pfn_valid(pfn));
-		if (pfn < pgdat->node_start_pfn || pfn >= pgdat_end_pfn(pgdat))
+		success = test_spte_young(args->vma->vm_mm, addr, end, bitmap, &last);
+		if (!success && !pte_young(pte[i])) {
+			skip_spte_young(args->vma->vm_mm, addr, bitmap, &last);
+			walk->mm_stats[MM_LEAF_OLD]++;
 			continue;
+		}
 
-		page = compound_head(pfn_to_page(pfn));
-		if (page_to_nid(page) != pgdat->node_id)
+		page = get_pfn_page(pfn, memcg, pgdat, walk->can_swap);
+		if (!page) {
+			skip_spte_young(args->vma->vm_mm, addr, bitmap, &last);
 			continue;
+		}
 
-		if (page_memcg_rcu(page) != memcg)
-			continue;
-
-		if (!ptep_test_and_clear_young(walk->vma, addr, pte + i))
-			continue;
+		clear_spte_young(args->vma->vm_mm, addr, bitmap, &last);
+		if (pte_young(pte[i]))
+			ptep_test_and_clear_young(args->vma, addr, pte + i);
 
 		young++;
 		priv->mm_stats[MM_PTE_YOUNG]++;
@@ -3865,7 +3918,7 @@ static void walk_pmd_range_locked(pud_t *pud, unsigned long next, struct vm_area
 			goto next;
 
 		if (!pmd_trans_huge(pmd[i])) {
-			if (IS_ENABLED(CONFIG_ARCH_HAS_NONLEAF_PMD_YOUNG) &&
+			if (arch_has_hw_nonleaf_pmd_young() &&
 			    get_cap(LRU_GEN_NONLEAF_YOUNG))
 				pmdp_test_and_clear_young(vma, addr, pmd + i);
 			goto next;
@@ -3972,15 +4025,15 @@ restart:
 #endif
 		priv->mm_stats[MM_PMD_TOTAL]++;
 
-#ifdef CONFIG_ARCH_HAS_NONLEAF_PMD_YOUNG
-		if (get_cap(LRU_GEN_NONLEAF_YOUNG)) {
+		if (arch_has_hw_nonleaf_pmd_young() &&
+		    get_cap(LRU_GEN_NONLEAF_YOUNG)) {
 			if (!pmd_young(val))
 				continue;
 
 			walk_pmd_range_locked(pud, addr, vma, walk, &pos);
 		}
-#endif
-		if (!priv->full_scan && !test_bloom_filter(priv->lruvec, priv->max_seq, pmd + i))
+
+		if (!walk->force_scan && !test_bloom_filter(walk->lruvec, walk->max_seq, pmd + i))
 			continue;
 
 		priv->mm_stats[MM_PMD_FOUND]++;
@@ -4081,13 +4134,24 @@ static void walk_mm(struct lruvec *lruvec, struct mm_struct *mm, struct lru_gen_
 	} while (err == -EAGAIN && walk->next_addr && !mm_is_oom_victim(mm));
 }
 
-static struct lru_gen_mm_walk *alloc_mm_walk(void)
+static struct lru_gen_mm_walk *set_mm_walk(struct pglist_data *pgdat, bool force_alloc)
 {
 	if (current->reclaim_state && current->reclaim_state->mm_walk)
 		return current->reclaim_state->mm_walk;
 
-	return kzalloc(sizeof(struct lru_gen_mm_walk),
-		       __GFP_HIGH | __GFP_NOMEMALLOC | __GFP_NOWARN);
+	if (pgdat && current_is_kswapd()) {
+		VM_WARN_ON_ONCE(walk);
+
+		walk = &pgdat->mm_walk;
+	} else if (!walk && force_alloc) {
+		VM_WARN_ON_ONCE(current_is_kswapd());
+
+		walk = kzalloc(sizeof(*walk), __GFP_HIGH | __GFP_NOMEMALLOC | __GFP_NOWARN);
+	}
+
+	current->reclaim_state->mm_walk = walk;
+
+	return walk;
 }
 
 static void free_mm_walk(struct lru_gen_mm_walk *walk)
@@ -4098,17 +4162,31 @@ static void free_mm_walk(struct lru_gen_mm_walk *walk)
 
 static void inc_min_seq(struct lruvec *lruvec)
 {
-	int type;
-	struct lru_gen_struct *lrugen = &lruvec->lrugen;
+	int zone;
+	int remaining = MAX_LRU_BATCH;
+	struct lru_gen_page *lrugen = &lruvec->lrugen;
+	int new_gen, old_gen = lru_gen_from_seq(lrugen->min_seq[type]);
 
 	VM_BUG_ON(!seq_is_valid(lruvec));
 
-	for (type = 0; type < ANON_AND_FILE; type++) {
-		if (get_nr_gens(lruvec, type) != MAX_NR_GENS)
-			continue;
+	/* prevent cold/hot inversion if force_scan is true */
+	for (zone = 0; zone < MAX_NR_ZONES; zone++) {
+		struct list_head *head = &lrugen->pages[old_gen][type][zone];
 
-		reset_ctrl_pos(lruvec, type, true);
-		WRITE_ONCE(lrugen->min_seq[type], lrugen->min_seq[type] + 1);
+		while (!list_empty(head)) {
+			struct page *page = lru_to_page(head);
+
+			VM_WARN_ON_ONCE_PAGE(PageUnevictable(page), page);
+			VM_WARN_ON_ONCE_PAGE(PageActive(page), page);
+			VM_WARN_ON_ONCE_PAGE(page_is_file_lru(page) != type, page);
+			VM_WARN_ON_ONCE_PAGE(page_zonenum(page) != zone, page);
+
+			new_gen = page_inc_gen(lruvec, page, false);
+			list_move_tail(&page->lru, &lrugen->pages[new_gen][type][zone]);
+
+			if (!--remaining)
+				return false;
+		}
 	}
 }
 
@@ -4116,7 +4194,7 @@ static bool try_to_inc_min_seq(struct lruvec *lruvec, bool can_swap)
 {
 	int gen, type, zone;
 	bool success = false;
-	struct lru_gen_struct *lrugen = &lruvec->lrugen;
+	struct lru_gen_page *lrugen = &lruvec->lrugen;
 	DEFINE_MIN_SEQ(lruvec);
 
 	VM_BUG_ON(!seq_is_valid(lruvec));
@@ -4126,7 +4204,7 @@ static bool try_to_inc_min_seq(struct lruvec *lruvec, bool can_swap)
 			gen = lru_gen_from_seq(min_seq[type]);
 
 			for (zone = 0; zone < MAX_NR_ZONES; zone++) {
-				if (!list_empty(&lrugen->lists[gen][type][zone]))
+				if (!list_empty(&lrugen->pages[gen][type][zone]))
 					goto next;
 			}
 
@@ -4136,7 +4214,7 @@ next:
 		;
 	}
 
-	/* see the comment on lru_gen_struct */
+	/* see the comment on lru_gen_page */
 	if (can_swap) {
 		min_seq[LRU_GEN_ANON] = min(min_seq[LRU_GEN_ANON], min_seq[LRU_GEN_FILE]);
 		min_seq[LRU_GEN_FILE] = max(min_seq[LRU_GEN_ANON], lrugen->min_seq[LRU_GEN_FILE]);
@@ -4158,7 +4236,7 @@ static void inc_max_seq(struct lruvec *lruvec)
 {
 	int prev, next;
 	int type, zone;
-	struct lru_gen_struct *lrugen = &lruvec->lrugen;
+	struct lru_gen_page *lrugen = &lruvec->lrugen;
 
 	spin_lock_irq(&lruvec->lru_lock);
 
@@ -4206,7 +4284,7 @@ static bool try_to_inc_max_seq(struct lruvec *lruvec, unsigned long max_seq,
 	bool success;
 	struct lru_gen_mm_walk *walk;
 	struct mm_struct *mm = NULL;
-	struct lru_gen_struct *lrugen = &lruvec->lrugen;
+	struct lru_gen_page *lrugen = &lruvec->lrugen;
 
 	VM_BUG_ON(max_seq > READ_ONCE(lrugen->max_seq));
 
@@ -4221,7 +4299,7 @@ static bool try_to_inc_max_seq(struct lruvec *lruvec, unsigned long max_seq,
 		goto done;
 	}
 
-	walk = alloc_mm_walk();
+	walk = set_mm_walk(NULL, true);
 	if (!walk) {
 		success = iterate_mm_list_nowalk(lruvec, max_seq);
 		goto done;
@@ -4246,13 +4324,13 @@ done:
 		if (!current_is_kswapd() && !sc->priority)
 			wait_event_killable(lruvec->mm_state.wait,
 					    max_seq < READ_ONCE(lrugen->max_seq));
-
-		return max_seq < READ_ONCE(lrugen->max_seq);
+		return false;
 	}
 
 	VM_BUG_ON(max_seq != READ_ONCE(lrugen->max_seq));
 
-	inc_max_seq(lruvec);
+	inc_max_seq(lruvec, can_swap, force_scan);
+	kernfs_notify(lru_gen_admin_node);
 	/* either this sees any waiters or they will see updated max_seq */
 	if (wq_has_sleeper(&lruvec->mm_state.wait))
 		wake_up_all(&lruvec->mm_state.wait);
@@ -4262,99 +4340,52 @@ done:
 	return true;
 }
 
-static long get_nr_evictable(struct lruvec *lruvec, unsigned long max_seq,
-			     unsigned long *min_seq, bool can_swap, bool *need_aging)
+static bool lruvec_is_sizable(struct lruvec *lruvec, struct scan_control *sc)
 {
 	int gen, type, zone;
-	long old = 0;
-	long young = 0;
-	long total = 0;
-	struct lru_gen_struct *lrugen = &lruvec->lrugen;
+	unsigned long total = 0;
+	bool can_swap = get_swappiness(lruvec, sc);
+	struct lru_gen_page *lrugen = &lruvec->lrugen;
+	struct mem_cgroup *memcg = lruvec_memcg(lruvec);
+	DEFINE_MAX_SEQ(lruvec);
+	DEFINE_MIN_SEQ(lruvec);
 
 	for (type = !can_swap; type < ANON_AND_FILE; type++) {
 		unsigned long seq;
 
 		for (seq = min_seq[type]; seq <= max_seq; seq++) {
-			long size = 0;
-
 			gen = lru_gen_from_seq(seq);
 
 			for (zone = 0; zone < MAX_NR_ZONES; zone++)
-				size += READ_ONCE(lrugen->nr_pages[gen][type][zone]);
-
-			total += size;
-			if (seq == max_seq)
-				young += size;
-			if (seq + MIN_NR_GENS == max_seq)
-				old += size;
+				total += max(READ_ONCE(lrugen->nr_pages[gen][type][zone]), 0L);
 		}
 	}
 
-	/*
-	 * The aging and the eviction is a typical producer-consumer model. The
-	 * aging tries to be lazy to reduce the unnecessary overhead. On the
-	 * other hand, the eviction stalls when the number of generations
-	 * reaches MIN_NR_GENS. So ideally, there should be MIN_NR_GENS+1
-	 * generations, hence the first two if's.
-	 *
-	 * In addition, it's ideal to spread pages out evenly, meaning
-	 * 1/(MIN_NR_GENS+1) of the total number of pages for each generation. A
-	 * reasonable range for this average portion would [1/MIN_NR_GENS,
-	 * 1/(MIN_NR_GENS+2)]. From the consumer's POV, the eviction only cares
-	 * about the lower bound of cold pages, i.e., 1/(MIN_NR_GENS+2), whereas
-	 * from the producer's POV, the aging only cares about the upper bound
-	 * of hot pages, i.e., 1/MIN_NR_GENS.
-	 */
-	if (min_seq[LRU_GEN_FILE] + MIN_NR_GENS > max_seq)
-		*need_aging = true;
-	else if (min_seq[LRU_GEN_FILE] + MIN_NR_GENS < max_seq)
-		*need_aging = false;
-	else if (young * MIN_NR_GENS > total)
-		*need_aging = true;
-	else if (old * (MIN_NR_GENS + 2) < total)
-		*need_aging = true;
-	else
-		*need_aging = false;
-
-	return total > 0 ? total : 0;
+	/* whether the size is big enough to be helpful */
+	return mem_cgroup_online(memcg) ? (total >> sc->priority) : total;
 }
 
-static bool age_lruvec(struct lruvec *lruvec, struct scan_control *sc,
-		       unsigned long min_ttl)
+static bool lruvec_is_reclaimable(struct lruvec *lruvec, struct scan_control *sc,
+				  unsigned long min_ttl)
 {
-	bool need_aging;
-	long nr_to_scan;
-	int swappiness = get_swappiness(lruvec, sc);
+	int gen;
+	unsigned long birth;
 	struct mem_cgroup *memcg = lruvec_memcg(lruvec);
-	DEFINE_MAX_SEQ(lruvec);
 	DEFINE_MIN_SEQ(lruvec);
 
-	if (min_ttl) {
-		int gen = lru_gen_from_seq(min_seq[LRU_GEN_FILE]);
-		unsigned long birth = READ_ONCE(lruvec->lrugen.timestamps[gen]);
+	/* see the comment on lru_gen_page */
+	gen = lru_gen_from_seq(min_seq[LRU_GEN_FILE]);
+	birth = READ_ONCE(lruvec->lrugen.timestamps[gen]);
 
-		if (time_is_after_jiffies(birth + min_ttl))
-			return false;
-	}
+	if (time_is_after_jiffies(birth + min_ttl))
+		return false;
+
+	if (!lruvec_is_sizable(lruvec, sc))
+		return false;
 
 	mem_cgroup_calculate_protection(NULL, memcg);
 
-	if (mem_cgroup_below_min(memcg))
-		return false;
-
-	nr_to_scan = get_nr_evictable(lruvec, max_seq, min_seq, swappiness, &need_aging);
-	if (!nr_to_scan)
-		return false;
-
-	nr_to_scan >>= sc->priority;
-
-	if (!mem_cgroup_online(memcg))
-		nr_to_scan++;
-
-	if (nr_to_scan && need_aging && (!mem_cgroup_below_low(memcg) || sc->memcg_low_reclaim))
-		try_to_inc_max_seq(lruvec, max_seq, sc, swappiness, false);
-
-	return true;
+	return !mem_cgroup_below_min(memcg);
 }
 
 /* to protect the working set of the last N jiffies */
@@ -4363,45 +4394,30 @@ static unsigned long lru_gen_min_ttl __read_mostly;
 static void lru_gen_age_node(struct pglist_data *pgdat, struct scan_control *sc)
 {
 	struct mem_cgroup *memcg;
-	bool success = false;
 	unsigned long min_ttl = READ_ONCE(lru_gen_min_ttl);
 
-	VM_BUG_ON(!current_is_kswapd());
+	VM_WARN_ON_ONCE(!current_is_kswapd());
 
-	/*
-	 * To reduce the chance of going into the aging path or swapping, which
-	 * can be costly, optimistically skip them unless their corresponding
-	 * flags were cleared in the eviction path. This improves the overall
-	 * performance when multiple memcgs are available.
-	 */
-	if (!sc->memcgs_need_aging) {
-		sc->memcgs_need_aging = true;
-		sc->memcgs_avoid_swapping = !sc->memcgs_need_swapping;
-		sc->memcgs_need_swapping = true;
+	/* check the order to exclude compaction-induced reclaim */
+	if (!min_ttl || sc->order || sc->priority == DEF_PRIORITY)
 		return;
-	}
-
-	sc->memcgs_need_swapping = true;
-	sc->memcgs_avoid_swapping = true;
-
-	current->reclaim_state->mm_walk = &pgdat->mm_walk;
 
 	memcg = mem_cgroup_iter(NULL, NULL, NULL);
 	do {
 		struct lruvec *lruvec = mem_cgroup_lruvec(memcg, pgdat);
 
-		if (age_lruvec(lruvec, sc, min_ttl))
-			success = true;
+		if (lruvec_is_reclaimable(lruvec, sc, min_ttl)) {
+			mem_cgroup_iter_break(NULL, memcg);
+			return;
+		}
 
 		cond_resched();
 	} while ((memcg = mem_cgroup_iter(NULL, memcg, NULL)));
 
-	current->reclaim_state->mm_walk = NULL;
-
 	/*
 	 * The main goal is to OOM kill if every generation from all memcgs is
-	 * younger than min_ttl. However, another theoretical possibility is all
-	 * memcgs are either below min or empty.
+	 * younger than min_ttl. However, another possibility is all memcgs are
+	 * either too small or below min.
 	 */
 	if (!success && mutex_trylock(&oom_lock)) {
 		struct oom_control oc = {
@@ -4415,6 +4431,32 @@ static void lru_gen_age_node(struct pglist_data *pgdat, struct scan_control *sc)
 	}
 }
 
+static bool should_look_around(struct vm_area_struct *vma, unsigned long addr,
+			       pte_t *pte, int *young)
+{
+	unsigned long old = true;
+
+	if (!get_cap(LRU_GEN_SPTE_WALK)) {
+		old = !pte_young(*pte);
+		*young = ptep_clear_flush_young_notify(vma, addr, pte);
+
+		return !old;
+	}
+
+	*young = mmu_notifier_test_clear_young(vma->vm_mm, addr, addr + PAGE_SIZE, true, &old);
+
+	if (!old)
+		*young = true;
+
+	if (pte_young(*pte)) {
+		ptep_test_and_clear_young(vma, addr, pte);
+		*young = true;
+		return true;
+	}
+
+	return !old && get_cap(LRU_GEN_SPTE_WALK);
+}
+
 /*
  * This function exploits spatial locality when shrink_page_list() walks the
  * rmap. It scans the adjacent PTEs of a young PTE and promotes hot pages.
@@ -4422,19 +4464,20 @@ static void lru_gen_age_node(struct pglist_data *pgdat, struct scan_control *sc)
  * to the PTE table to the Bloom filter. This process is a feedback loop from
  * the eviction to the aging.
  */
-void lru_gen_look_around(struct page_vma_mapped_walk *pvmw)
+bool lru_gen_look_around(struct page_vma_mapped_walk *pvmw)
 {
 	int i;
-	pte_t *pte;
 	unsigned long start;
 	unsigned long end;
-	unsigned long addr;
-	struct page *page;
 	struct lru_gen_mm_walk *walk;
+	unsigned long bitmap[BITS_TO_LONGS(MIN_LRU_BATCH)];
+	unsigned long last = 0;
 	int young = 0;
-	unsigned long bitmap[BITS_TO_LONGS(MIN_LRU_BATCH)] = {};
-	struct mem_cgroup *memcg = page_memcg(pvmw->page);
-	struct pglist_data *pgdat = page_pgdat(pvmw->page);
+	pte_t *pte = pvmw->pte;
+	unsigned long addr = pvmw->address;
+	struct page *page = pvmw->page;
+	struct mem_cgroup *memcg = page_memcg(page);
+	struct pglist_data *pgdat = page_pgdat(page);
 	struct lruvec *lruvec = mem_cgroup_lruvec(memcg, pgdat);
 	DEFINE_MAX_SEQ(lruvec);
 	int old_gen, new_gen = lru_gen_from_seq(max_seq);
@@ -4442,55 +4485,65 @@ void lru_gen_look_around(struct page_vma_mapped_walk *pvmw)
 	lockdep_assert_held(pvmw->ptl);
 	VM_BUG_ON_PAGE(PageLRU(pvmw->page), pvmw->page);
 
-	if (spin_is_contended(pvmw->ptl))
-		return;
+	if (!should_look_around(pvmw->vma, addr, pte, &young))
+		return young;
 
-	start = max(pvmw->address & PMD_MASK, pvmw->vma->vm_start);
-	end = pmd_addr_end(pvmw->address, pvmw->vma->vm_end);
+	if (spin_is_contended(pvmw->ptl))
+		return young;
+
+	/* avoid taking the LRU lock under the PTL when possible */
+	walk = current->reclaim_state ? current->reclaim_state->mm_walk : NULL;
+
+	start = max(addr & PMD_MASK, pvmw->vma->vm_start);
+	end = min(addr | ~PMD_MASK, pvmw->vma->vm_end - 1) + 1;
+
+	if (end - start == PAGE_SIZE)
+		return young;
 
 	if (end - start > MIN_LRU_BATCH * PAGE_SIZE) {
-		if (pvmw->address - start < MIN_LRU_BATCH * PAGE_SIZE / 2)
+		if (addr - start < MIN_LRU_BATCH * PAGE_SIZE / 2)
 			end = start + MIN_LRU_BATCH * PAGE_SIZE;
-		else if (end - pvmw->address < MIN_LRU_BATCH * PAGE_SIZE / 2)
+		else if (end - addr < MIN_LRU_BATCH * PAGE_SIZE / 2)
 			start = end - MIN_LRU_BATCH * PAGE_SIZE;
 		else {
-			start = pvmw->address - MIN_LRU_BATCH * PAGE_SIZE / 2;
-			end = pvmw->address + MIN_LRU_BATCH * PAGE_SIZE / 2;
+			start = addr - MIN_LRU_BATCH * PAGE_SIZE / 2;
+			end = addr + MIN_LRU_BATCH * PAGE_SIZE / 2;
 		}
 	}
 
-	pte = pvmw->pte - (pvmw->address - start) / PAGE_SIZE;
+	/* page_update_gen() requires stable page_memcg() */
+	if (!mem_cgroup_trylock_pages(memcg))
+		return young;
 
-	rcu_read_lock();
 	arch_enter_lazy_mmu_mode();
 
+	pte -= (addr - start) / PAGE_SIZE;
+
 	for (i = 0, addr = start; addr != end; i++, addr += PAGE_SIZE) {
-		unsigned long pfn = pte_pfn(pte[i]);
+		bool success;
+		unsigned long pfn;
 
-		VM_BUG_ON(addr < pvmw->vma->vm_start || addr >= pvmw->vma->vm_end);
-
-		if (!pte_present(pte[i]) || is_zero_pfn(pfn))
+		pfn = get_pte_pfn(pte[i], pvmw->vma, addr);
+		if (pfn == -1) {
+			skip_spte_young(pvmw->vma->vm_mm, addr, bitmap, &last);
 			continue;
+		}
 
-		if (WARN_ON_ONCE(pte_devmap(pte[i]) || pte_special(pte[i])))
+		success = test_spte_young(pvmw->vma->vm_mm, addr, end, bitmap, &last);
+		if (!success && !pte_young(pte[i])) {
+			skip_spte_young(pvmw->vma->vm_mm, addr, bitmap, &last);
 			continue;
+		}
 
-		if (!pte_young(pte[i]))
+		page = get_pfn_page(pfn, memcg, pgdat, !walk || walk->can_swap);
+		if (!page) {
+			skip_spte_young(pvmw->vma->vm_mm, addr, bitmap, &last);
 			continue;
+		}
 
-		VM_BUG_ON(!pfn_valid(pfn));
-		if (pfn < pgdat->node_start_pfn || pfn >= pgdat_end_pfn(pgdat))
-			continue;
-
-		page = compound_head(pfn_to_page(pfn));
-		if (page_to_nid(page) != pgdat->node_id)
-			continue;
-
-		if (page_memcg_rcu(page) != memcg)
-			continue;
-
-		if (!ptep_test_and_clear_young(pvmw->vma, addr, pte + i))
-			continue;
+		clear_spte_young(pvmw->vma->vm_mm, addr, bitmap, &last);
+		if (pte_young(pte[i]))
+			ptep_test_and_clear_young(pvmw->vma, addr, pte + i);
 
 		young++;
 
@@ -4498,56 +4551,29 @@ void lru_gen_look_around(struct page_vma_mapped_walk *pvmw)
 		    !(PageAnon(page) && PageSwapBacked(page) && !PageSwapCache(page)))
 			set_page_dirty(page);
 
+		if (walk) {
+			old_gen = page_update_gen(page, new_gen);
+			if (old_gen >= 0 && old_gen != new_gen)
+				update_batch_size(walk, page, old_gen, new_gen);
+
+			continue;
+		}
+
 		old_gen = page_lru_gen(page);
 		if (old_gen < 0)
 			SetPageReferenced(page);
 		else if (old_gen != new_gen)
-			__set_bit(i, bitmap);
+			activate_page(page);
 	}
 
 	arch_leave_lazy_mmu_mode();
-	rcu_read_unlock();
+	mem_cgroup_unlock_pages();
 
 	/* feedback from rmap walkers to page table walkers */
 	if (suitable_to_scan(i, young))
 		update_bloom_filter(lruvec, max_seq, pvmw->pmd);
 
-	walk = current->reclaim_state ? current->reclaim_state->mm_walk : NULL;
-
-	if (!walk && bitmap_weight(bitmap, MIN_LRU_BATCH) < PAGEVEC_SIZE) {
-		for_each_set_bit(i, bitmap, MIN_LRU_BATCH)
-			activate_page(pte_page(pte[i]));
-		return;
-	}
-
-	/* page_update_gen() requires stable page_memcg() */
-	if (!mem_cgroup_trylock_pages(memcg))
-		return;
-
-	if (!walk) {
-		spin_lock_irq(&lruvec->lru_lock);
-		new_gen = lru_gen_from_seq(lruvec->lrugen.max_seq);
-	}
-
-	for_each_set_bit(i, bitmap, MIN_LRU_BATCH) {
-		page = compound_head(pte_page(pte[i]));
-		if (page_memcg_rcu(page) != memcg)
-			continue;
-
-		old_gen = page_update_gen(page, new_gen);
-		if (old_gen < 0 || old_gen == new_gen)
-			continue;
-
-		if (walk)
-			update_batch_size(walk, page, old_gen, new_gen);
-		else
-			lru_gen_update_size(lruvec, page, old_gen, new_gen);
-	}
-
-	if (!walk)
-		spin_unlock_irq(&lruvec->lru_lock);
-
-	mem_cgroup_unlock_pages();
+	return young;
 }
 
 /******************************************************************************
@@ -4562,7 +4588,9 @@ static bool sort_page(struct lruvec *lruvec, struct page *page, int tier_idx)
 	int zone = page_zonenum(page);
 	int tier = page_lru_tier(page);
 	int delta = thp_nr_pages(page);
-	struct lru_gen_struct *lrugen = &lruvec->lrugen;
+	int refs = page_lru_refs(page);
+	int tier = lru_tier_from_refs(refs);
+	struct lru_gen_page *lrugen = &lruvec->lrugen;
 
 	VM_BUG_ON_PAGE(gen >= MAX_NR_GENS, page);
 
@@ -4584,7 +4612,7 @@ static bool sort_page(struct lruvec *lruvec, struct page *page, int tier_idx)
 	}
 
 	if (gen != lru_gen_from_seq(lrugen->min_seq[type])) {
-		list_move(&page->lru, &lrugen->lists[gen][type][zone]);
+		list_move(&page->lru, &lrugen->pages[gen][type][zone]);
 		return true;
 	}
 
@@ -4592,7 +4620,7 @@ static bool sort_page(struct lruvec *lruvec, struct page *page, int tier_idx)
 		int hist = lru_hist_from_seq(lrugen->min_seq[type]);
 
 		gen = page_inc_gen(lruvec, page, false);
-		list_move_tail(&page->lru, &lrugen->lists[gen][type][zone]);
+		list_move_tail(&page->lru, &lrugen->pages[gen][type][zone]);
 
 		WRITE_ONCE(lrugen->protected[hist][type][tier - 1],
 			   lrugen->protected[hist][type][tier - 1] + delta);
@@ -4603,7 +4631,7 @@ static bool sort_page(struct lruvec *lruvec, struct page *page, int tier_idx)
 	if (PageLocked(page) || PageWriteback(page) ||
 	    (type == LRU_GEN_FILE && PageDirty(page))) {
 		gen = page_inc_gen(lruvec, page, true);
-		list_move(&page->lru, &lrugen->lists[gen][type][zone]);
+		list_move(&page->lru, &lrugen->pages[gen][type][zone]);
 		return true;
 	}
 
@@ -4614,11 +4642,10 @@ static bool isolate_page(struct lruvec *lruvec, struct page *page, struct scan_c
 {
 	bool success;
 
-	if (!sc->may_unmap && page_mapped(page))
-		return false;
-
-	if (!(sc->may_writepage && (sc->gfp_mask & __GFP_IO)) &&
-	    (PageDirty(page) || (PageAnon(page) && !PageSwapCache(page))))
+	/* swapping inhibited */
+	if (!(sc->gfp_mask & __GFP_IO) &&
+	    (PageDirty(page) ||
+	     (PageAnon(page) && !PageSwapCache(page))))
 		return false;
 
 	if (!get_page_unless_zero(page))
@@ -4644,7 +4671,7 @@ static int scan_pages(struct lruvec *lruvec, struct scan_control *sc,
 	int scanned = 0;
 	int isolated = 0;
 	int remaining = MAX_LRU_BATCH;
-	struct lru_gen_struct *lrugen = &lruvec->lrugen;
+	struct lru_gen_page *lrugen = &lruvec->lrugen;
 	struct mem_cgroup *memcg = lruvec_memcg(lruvec);
 
 	VM_BUG_ON(!list_empty(list));
@@ -4657,7 +4684,7 @@ static int scan_pages(struct lruvec *lruvec, struct scan_control *sc,
 	for (zone = sc->reclaim_idx; zone >= 0; zone--) {
 		LIST_HEAD(moved);
 		int skipped = 0;
-		struct list_head *head = &lrugen->lists[gen][type][zone];
+		struct list_head *head = &lrugen->pages[gen][type][zone];
 
 		while (!list_empty(head)) {
 			struct page *page = lru_to_page(head);
@@ -4706,9 +4733,8 @@ static int scan_pages(struct lruvec *lruvec, struct scan_control *sc,
 	__count_vm_events(PGSCAN_ANON + type, isolated);
 
 	/*
-	 * There might not be eligible pages due to reclaim_idx, may_unmap and
-	 * may_writepage. Check the remaining to prevent livelock if there is no
-	 * progress.
+	 * There might not be eligible pages due to reclaim_idx. Check the
+	 * remaining to prevent livelock if it's not making progress.
 	 */
 	return isolated || !remaining ? scanned : 0;
 }
@@ -4805,17 +4831,19 @@ static int isolate_pages(struct lruvec *lruvec, struct scan_control *sc, int swa
 	return scanned;
 }
 
-static int evict_pages(struct lruvec *lruvec, struct scan_control *sc, int swappiness,
-		       bool *swapped)
+static int evict_pages(struct lruvec *lruvec, struct scan_control *sc, int swappiness)
 {
 	int type;
 	int scanned;
 	int reclaimed;
 	LIST_HEAD(list);
+	LIST_HEAD(clean);
 	struct page *page;
+	struct page *next;
 	enum vm_event_item item;
 	struct reclaim_stat stat;
 	struct lru_gen_mm_walk *walk;
+	bool skip_retry = false;
 	struct mem_cgroup *memcg = lruvec_memcg(lruvec);
 	struct pglist_data *pgdat = lruvec_pgdat(lruvec);
 
@@ -4833,21 +4861,37 @@ static int evict_pages(struct lruvec *lruvec, struct scan_control *sc, int swapp
 
 	if (list_empty(&list))
 		return scanned;
-
+retry:
 	reclaimed = shrink_page_list(&list, pgdat, sc, &stat, false);
+	sc->nr_reclaimed += reclaimed;
 
-	/*
-	 * To avoid livelock, don't add rejected pages back to the same lists
-	 * they were isolated from. See lru_gen_add_page().
-	 */
-	list_for_each_entry(page, &list, lru) {
-		ClearPageReferenced(page);
-		ClearPageWorkingset(page);
+	list_for_each_entry_safe_reverse(page, next, &list, lru) {
+		if (!page_evictable(page)) {
+			list_del(&page->lru);
+			putback_lru_page(page);
+			continue;
+		}
 
-		if (PageReclaim(page) && (PageDirty(page) || PageWriteback(page)))
-			ClearPageActive(page);
-		else if (page_is_file_lru(page) || PageSwapCache(page))
-			SetPageActive(page);
+		if (PageReclaim(page) &&
+		    (PageDirty(page) || PageWriteback(page))) {
+			/* restore LRU_REFS_FLAGS cleared by isolate_page() */
+			if (PageWorkingset(page))
+				SetPageReferenced(page);
+			continue;
+		}
+
+		if (skip_retry || PageActive(page) || PageReferenced(page) ||
+		    page_mapped(page) || PageLocked(page) ||
+		    PageDirty(page) || PageWriteback(page)) {
+			/* don't add rejected pages to the oldest generation */
+			set_mask_bits(&page->flags, LRU_REFS_MASK | LRU_REFS_FLAGS,
+				      BIT(PG_active));
+			continue;
+		}
+
+		/* retry pages that may have missed rotate_reclaimable_page() */
+		list_move(&page->lru, &clean);
+		sc->nr_scanned -= thp_nr_pages(page);
 	}
 
 	spin_lock_irq(&lruvec->lru_lock);
@@ -4869,113 +4913,405 @@ static int evict_pages(struct lruvec *lruvec, struct scan_control *sc, int swapp
 	mem_cgroup_uncharge_list(&list);
 	free_unref_page_list(&list);
 
-	sc->nr_reclaimed += reclaimed;
+	INIT_LIST_HEAD(&list);
+	list_splice_init(&clean, &list);
 
-	if (type == LRU_GEN_ANON && swapped)
-		*swapped = true;
+	if (!list_empty(&list)) {
+		skip_retry = true;
+		goto retry;
+	}
 
 	return scanned;
 }
 
+static bool should_run_aging(struct lruvec *lruvec, unsigned long max_seq,
+			     struct scan_control *sc, bool can_swap, unsigned long *nr_to_scan)
+{
+	int gen, type, zone;
+	unsigned long old = 0;
+	unsigned long young = 0;
+	unsigned long total = 0;
+	struct lru_gen_page *lrugen = &lruvec->lrugen;
+	struct mem_cgroup *memcg = lruvec_memcg(lruvec);
+	DEFINE_MIN_SEQ(lruvec);
+
+	/* whether this lruvec is completely out of cold pages */
+	if (min_seq[!can_swap] + MIN_NR_GENS > max_seq) {
+		*nr_to_scan = 0;
+		return true;
+	}
+
+	for (type = !can_swap; type < ANON_AND_FILE; type++) {
+		unsigned long seq;
+
+		for (seq = min_seq[type]; seq <= max_seq; seq++) {
+			unsigned long size = 0;
+
+			gen = lru_gen_from_seq(seq);
+
+			for (zone = 0; zone < MAX_NR_ZONES; zone++)
+				size += max(READ_ONCE(lrugen->nr_pages[gen][type][zone]), 0L);
+
+			total += size;
+			if (seq == max_seq)
+				young += size;
+			else if (seq + MIN_NR_GENS == max_seq)
+				old += size;
+		}
+	}
+
+	/* try to scrape all its memory if this memcg was deleted */
+	*nr_to_scan = mem_cgroup_online(memcg) ? (total >> sc->priority) : total;
+
+	/*
+	 * The aging tries to be lazy to reduce the overhead, while the eviction
+	 * stalls when the number of generations reaches MIN_NR_GENS. Hence, the
+	 * ideal number of generations is MIN_NR_GENS+1.
+	 */
+	if (min_seq[!can_swap] + MIN_NR_GENS < max_seq)
+		return false;
+
+	/*
+	 * It's also ideal to spread pages out evenly, i.e., 1/(MIN_NR_GENS+1)
+	 * of the total number of pages for each generation. A reasonable range
+	 * for this average portion is [1/MIN_NR_GENS, 1/(MIN_NR_GENS+2)]. The
+	 * aging cares about the upper bound of hot pages, while the eviction
+	 * cares about the lower bound of cold pages.
+	 */
+	if (young * MIN_NR_GENS > total)
+		return true;
+	if (old * (MIN_NR_GENS + 2) < total)
+		return true;
+
+	return false;
+}
+
+/*
+ * For future optimizations:
+ * 1. Defer try_to_inc_max_seq() to workqueues to reduce latency for memcg
+ *    reclaim.
+ */
 static long get_nr_to_scan(struct lruvec *lruvec, struct scan_control *sc, bool can_swap)
 {
 	bool need_aging;
 	long nr_to_scan;
 	struct mem_cgroup *memcg = lruvec_memcg(lruvec);
 	DEFINE_MAX_SEQ(lruvec);
-	DEFINE_MIN_SEQ(lruvec);
 
-	if (mem_cgroup_below_min(memcg) ||
-	    (mem_cgroup_below_low(memcg) && !sc->memcg_low_reclaim))
+	if (mem_cgroup_below_min(memcg))
 		return 0;
 
-	nr_to_scan = get_nr_evictable(lruvec, max_seq, min_seq, can_swap, &need_aging);
-	if (!nr_to_scan)
-		return 0;
-
-	/* reset the priority if the target has been met */
-	nr_to_scan >>= sc->nr_reclaimed < sc->nr_to_reclaim ? sc->priority : DEF_PRIORITY;
-
-	if (!mem_cgroup_online(memcg))
-		nr_to_scan++;
-
-	if (!nr_to_scan)
-		return 0;
-
-	if (!need_aging) {
-		sc->memcgs_need_aging = false;
-		return nr_to_scan;
-	}
-
-	/* leave the work to lru_gen_age_node() */
-	if (current_is_kswapd())
-		return 0;
-
-	/* try other memcgs before going to the aging path */
-	if (!cgroup_reclaim(sc) && !sc->force_deactivate) {
-		sc->skipped_deactivate = true;
-		return 0;
-	}
-
-	if (try_to_inc_max_seq(lruvec, max_seq, sc, can_swap, false))
+	if (!should_run_aging(lruvec, max_seq, sc, can_swap, &nr_to_scan))
 		return nr_to_scan;
 
-	return min_seq[LRU_GEN_FILE] + MIN_NR_GENS <= max_seq ? nr_to_scan : 0;
+	/* skip the aging path at the default priority */
+	if (sc->priority == DEF_PRIORITY)
+		return nr_to_scan;
+
+	/* skip this lruvec as it's low on cold pages */
+	return try_to_inc_max_seq(lruvec, max_seq, sc, can_swap, false) ? -1 : 0;
 }
 
-static void lru_gen_shrink_lruvec(struct lruvec *lruvec, struct scan_control *sc)
+static unsigned long get_nr_to_reclaim(struct scan_control *sc)
 {
-	struct blk_plug plug;
-	long scanned = 0;
-	bool swapped = false;
-	unsigned long reclaimed = sc->nr_reclaimed;
-	struct pglist_data *pgdat = lruvec_pgdat(lruvec);
+	/* don't abort memcg reclaim to ensure fairness */
+	if (!global_reclaim(sc))
+		return -1;
 
-	lru_add_drain();
+	return max(sc->nr_to_reclaim, compact_gap(sc->order));
+}
 
-	blk_start_plug(&plug);
+static bool try_to_shrink_lruvec(struct lruvec *lruvec, struct scan_control *sc)
+{
+	long nr_to_scan;
+	unsigned long scanned = 0;
+	unsigned long nr_to_reclaim = get_nr_to_reclaim(sc);
+	int swappiness = get_swappiness(lruvec, sc);
 
-	if (current_is_kswapd())
-		current->reclaim_state->mm_walk = &pgdat->mm_walk;
+	/* clean file pages are more likely to exist */
+	if (swappiness && !(sc->gfp_mask & __GFP_IO))
+		swappiness = 1;
 
 	while (true) {
 		int delta;
-		int swappiness;
-		long nr_to_scan;
-
-		if (sc->may_swap)
-			swappiness = get_swappiness(lruvec, sc);
-		else if (!cgroup_reclaim(sc) && get_swappiness(lruvec, sc))
-			swappiness = 1;
-		else
-			swappiness = 0;
 
 		nr_to_scan = get_nr_to_scan(lruvec, sc, swappiness);
-		if (!nr_to_scan)
+		if (nr_to_scan <= 0)
 			break;
 
-		delta = evict_pages(lruvec, sc, swappiness, &swapped);
+		delta = evict_pages(lruvec, sc, swappiness);
 		if (!delta)
 			break;
 
-		if (sc->memcgs_avoid_swapping && swappiness < 200 && swapped)
+		scanned += delta;
+		if (scanned >= nr_to_scan)
 			break;
 
-		scanned += delta;
-		if (scanned >= nr_to_scan) {
-			if (!swapped && sc->nr_reclaimed - reclaimed >= MIN_LRU_BATCH)
-				sc->memcgs_need_swapping = false;
+		if (sc->nr_reclaimed >= nr_to_reclaim)
 			break;
 		}
 
 		cond_resched();
 	}
 
-	if (current_is_kswapd())
-		current->reclaim_state->mm_walk = NULL;
+	/* whether try_to_inc_max_seq() was successful */
+	return nr_to_scan < 0;
+}
+
+static int shrink_one(struct lruvec *lruvec, struct scan_control *sc)
+{
+	bool success;
+	unsigned long scanned = sc->nr_scanned;
+	unsigned long reclaimed = sc->nr_reclaimed;
+	int seg = lru_gen_memcg_seg(lruvec);
+	struct mem_cgroup *memcg = lruvec_memcg(lruvec);
+	struct pglist_data *pgdat = lruvec_pgdat(lruvec);
+
+	/* see the comment on MEMCG_NR_GENS */
+	if (!lruvec_is_sizable(lruvec, sc))
+		return seg != MEMCG_LRU_TAIL ? MEMCG_LRU_TAIL : MEMCG_LRU_YOUNG;
+
+	mem_cgroup_calculate_protection(NULL, memcg);
+
+	if (mem_cgroup_below_min(memcg))
+		return MEMCG_LRU_YOUNG;
+
+	if (mem_cgroup_below_low(memcg)) {
+		/* see the comment on MEMCG_NR_GENS */
+		if (seg != MEMCG_LRU_TAIL)
+			return MEMCG_LRU_TAIL;
+
+		memcg_memory_event(memcg, MEMCG_LOW);
+	}
+
+	success = try_to_shrink_lruvec(lruvec, sc);
+
+	shrink_slab(sc->gfp_mask, pgdat->node_id, memcg, sc->priority);
+
+	vmpressure(sc->gfp_mask, memcg, false, sc->nr_scanned - scanned,
+		   sc->nr_reclaimed - reclaimed);
+
+	sc->nr_reclaimed += current->reclaim_state->reclaimed_slab;
+	current->reclaim_state->reclaimed_slab = 0;
+
+	return success ? MEMCG_LRU_YOUNG : 0;
+}
+
+#ifdef CONFIG_MEMCG
+
+static void shrink_many(struct pglist_data *pgdat, struct scan_control *sc)
+{
+	int op;
+	int gen;
+	int bin;
+	int first_bin;
+	struct lruvec *lruvec;
+	struct lru_gen_page *lrugen;
+	struct mem_cgroup *memcg;
+	const struct hlist_nulls_node *pos;
+	unsigned long nr_to_reclaim = get_nr_to_reclaim(sc);
+
+	bin = first_bin = prandom_u32_max(MEMCG_NR_BINS);
+restart:
+	op = 0;
+	memcg = NULL;
+	gen = get_memcg_gen(READ_ONCE(pgdat->memcg_lru.seq));
+
+	rcu_read_lock();
+
+	hlist_nulls_for_each_entry_rcu(lrugen, pos, &pgdat->memcg_lru.fifo[gen][bin], list) {
+		if (op)
+			lru_gen_rotate_memcg(lruvec, op);
+
+		mem_cgroup_put(memcg);
+
+		lruvec = container_of(lrugen, struct lruvec, lrugen);
+		memcg = lruvec_memcg(lruvec);
+
+		if (!mem_cgroup_tryget(memcg)) {
+			op = 0;
+			memcg = NULL;
+			continue;
+		}
+
+		rcu_read_unlock();
+
+		op = shrink_one(lruvec, sc);
+
+		rcu_read_lock();
+
+		if (sc->nr_reclaimed >= nr_to_reclaim)
+			break;
+	}
+
+	rcu_read_unlock();
+
+	if (op)
+		lru_gen_rotate_memcg(lruvec, op);
+
+	mem_cgroup_put(memcg);
+
+	if (sc->nr_reclaimed >= nr_to_reclaim)
+		return;
+
+	/* restart if raced with lru_gen_rotate_memcg() */
+	if (gen != get_nulls_value(pos))
+		goto restart;
+
+	/* try the rest of the bins of the current generation */
+	bin = get_memcg_bin(bin + 1);
+	if (bin != first_bin)
+		goto restart;
+}
+
+static void lru_gen_shrink_lruvec(struct lruvec *lruvec, struct scan_control *sc)
+{
+	struct blk_plug plug;
+
+	VM_WARN_ON_ONCE(global_reclaim(sc));
+	VM_WARN_ON_ONCE(!sc->may_writepage || !sc->may_unmap);
+
+	lru_add_drain();
+
+	blk_start_plug(&plug);
+
+	set_mm_walk(NULL, false);
+
+	if (try_to_shrink_lruvec(lruvec, sc))
+		lru_gen_rotate_memcg(lruvec, MEMCG_LRU_YOUNG);
+
+	clear_mm_walk();
 
 	blk_finish_plug(&plug);
 }
+
+#else /* !CONFIG_MEMCG */
+
+static void shrink_many(struct pglist_data *pgdat, struct scan_control *sc)
+{
+	BUILD_BUG();
+}
+
+static void lru_gen_shrink_lruvec(struct lruvec *lruvec, struct scan_control *sc)
+{
+	BUILD_BUG();
+}
+
+#endif
+
+static void set_initial_priority(struct pglist_data *pgdat, struct scan_control *sc)
+{
+	int priority;
+	unsigned long reclaimable;
+	struct lruvec *lruvec = mem_cgroup_lruvec(NULL, pgdat);
+
+	if (sc->priority != DEF_PRIORITY || sc->nr_to_reclaim < MIN_LRU_BATCH)
+		return;
+	/*
+	 * Determine the initial priority based on ((total / MEMCG_NR_GENS) >>
+	 * priority) * reclaimed_to_scanned_ratio = nr_to_reclaim, where the
+	 * estimated reclaimed_to_scanned_ratio = inactive / total.
+	 */
+	reclaimable = node_page_state(pgdat, NR_INACTIVE_FILE);
+	if (get_swappiness(lruvec, sc))
+		reclaimable += node_page_state(pgdat, NR_INACTIVE_ANON);
+
+	reclaimable /= MEMCG_NR_GENS;
+
+	/* round down reclaimable and round up sc->nr_to_reclaim */
+	priority = fls_long(reclaimable) - 1 - fls_long(sc->nr_to_reclaim - 1);
+
+	sc->priority = clamp(priority, 0, DEF_PRIORITY);
+}
+
+static void lru_gen_shrink_node(struct pglist_data *pgdat, struct scan_control *sc)
+{
+	struct blk_plug plug;
+	unsigned long reclaimed = sc->nr_reclaimed;
+
+	VM_WARN_ON_ONCE(!global_reclaim(sc));
+
+	/*
+	 * Unmapped clean pages are already prioritized. Scanning for more of
+	 * them is likely futile and can cause high reclaim latency when there
+	 * is a large number of memcgs.
+	 */
+	if (!sc->may_writepage || !sc->may_unmap)
+		goto done;
+
+	lru_add_drain();
+
+	blk_start_plug(&plug);
+
+	set_mm_walk(pgdat, false);
+
+	set_initial_priority(pgdat, sc);
+
+	if (current_is_kswapd())
+		sc->nr_reclaimed = 0;
+
+	if (mem_cgroup_disabled())
+		shrink_one(&pgdat->__lruvec, sc);
+	else
+		shrink_many(pgdat, sc);
+
+	if (current_is_kswapd())
+		sc->nr_reclaimed += reclaimed;
+
+	clear_mm_walk();
+
+	blk_finish_plug(&plug);
+done:
+	/* kswapd should never fail */
+	pgdat->kswapd_failures = 0;
+}
+
+#ifdef CONFIG_MEMCG
+void lru_gen_rotate_memcg(struct lruvec *lruvec, int op)
+{
+	int seg;
+	int old, new;
+	int bin = prandom_u32_max(MEMCG_NR_BINS);
+	struct pglist_data *pgdat = lruvec_pgdat(lruvec);
+
+	spin_lock(&pgdat->memcg_lru.lock);
+
+	VM_WARN_ON_ONCE(hlist_nulls_unhashed(&lruvec->lrugen.list));
+
+	seg = 0;
+	new = old = lruvec->lrugen.gen;
+
+	/* see the comment on MEMCG_NR_GENS */
+	if (op == MEMCG_LRU_HEAD)
+		seg = MEMCG_LRU_HEAD;
+	else if (op == MEMCG_LRU_TAIL)
+		seg = MEMCG_LRU_TAIL;
+	else if (op == MEMCG_LRU_OLD)
+		new = get_memcg_gen(pgdat->memcg_lru.seq);
+	else if (op == MEMCG_LRU_YOUNG)
+		new = get_memcg_gen(pgdat->memcg_lru.seq + 1);
+	else
+		VM_WARN_ON_ONCE(true);
+
+	hlist_nulls_del_rcu(&lruvec->lrugen.list);
+
+	if (op == MEMCG_LRU_HEAD || op == MEMCG_LRU_OLD)
+		hlist_nulls_add_head_rcu(&lruvec->lrugen.list, &pgdat->memcg_lru.fifo[new][bin]);
+	else
+		hlist_nulls_add_tail_rcu(&lruvec->lrugen.list, &pgdat->memcg_lru.fifo[new][bin]);
+
+	pgdat->memcg_lru.nr_memcgs[old]--;
+	pgdat->memcg_lru.nr_memcgs[new]++;
+
+	lruvec->lrugen.gen = new;
+	WRITE_ONCE(lruvec->lrugen.seg, seg);
+
+	if (!pgdat->memcg_lru.nr_memcgs[old] && old == get_memcg_gen(pgdat->memcg_lru.seq))
+		WRITE_ONCE(pgdat->memcg_lru.seq, pgdat->memcg_lru.seq + 1);
+
+	spin_unlock(&pgdat->memcg_lru.lock);
+}
+#endif
 
 /******************************************************************************
  *                          state change
@@ -4983,7 +5319,7 @@ static void lru_gen_shrink_lruvec(struct lruvec *lruvec, struct scan_control *sc
 
 static bool __maybe_unused state_is_valid(struct lruvec *lruvec)
 {
-	struct lru_gen_struct *lrugen = &lruvec->lrugen;
+	struct lru_gen_page *lrugen = &lruvec->lrugen;
 
 	if (lrugen->enabled) {
 		enum lru_list lru;
@@ -4996,7 +5332,7 @@ static bool __maybe_unused state_is_valid(struct lruvec *lruvec)
 		int gen, type, zone;
 
 		for_each_gen_type_zone(gen, type, zone) {
-			if (!list_empty(&lrugen->lists[gen][type][zone]))
+			if (!list_empty(&lrugen->pages[gen][type][zone]))
 				return false;
 
 			/* unlikely but not a bug when reset_batch_size() is pending */
@@ -5047,7 +5383,7 @@ static bool drain_evictable(struct lruvec *lruvec)
 	int remaining = MAX_LRU_BATCH;
 
 	for_each_gen_type_zone(gen, type, zone) {
-		struct list_head *head = &lruvec->lrugen.lists[gen][type][zone];
+		struct list_head *head = &lruvec->lrugen.pages[gen][type][zone];
 
 		while (!list_empty(head)) {
 			bool success;
@@ -5131,6 +5467,15 @@ unlock:
  *                          sysfs interface
  ******************************************************************************/
 
+static int run_aging(struct lruvec *lruvec, unsigned long seq, struct scan_control *sc,
+		     bool can_swap, bool force_scan);
+
+static int run_eviction(struct lruvec *lruvec, unsigned long seq, struct scan_control *sc,
+			int swappiness, unsigned long nr_to_reclaim);
+
+static int run_cmd(char cmd, int memcg_id, int nid, unsigned long seq,
+		   struct scan_control *sc, int swappiness, unsigned long opt);
+
 static ssize_t show_min_ttl(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
 {
 	return sprintf(buf, "%u\n", jiffies_to_msecs(READ_ONCE(lru_gen_min_ttl)));
@@ -5163,8 +5508,11 @@ static ssize_t show_enable(struct kobject *kobj, struct kobj_attribute *attr, ch
 	if (arch_has_hw_pte_young() && get_cap(LRU_GEN_MM_WALK))
 		caps |= BIT(LRU_GEN_MM_WALK);
 
-	if (IS_ENABLED(CONFIG_ARCH_HAS_NONLEAF_PMD_YOUNG) && get_cap(LRU_GEN_NONLEAF_YOUNG))
+	if (arch_has_hw_nonleaf_pmd_young() && get_cap(LRU_GEN_NONLEAF_YOUNG))
 		caps |= BIT(LRU_GEN_NONLEAF_YOUNG);
+
+	if (kvm_arch_has_test_clear_young() && get_cap(LRU_GEN_SPTE_WALK))
+		caps |= BIT(LRU_GEN_SPTE_WALK);
 
 	return snprintf(buf, PAGE_SIZE, "0x%04x\n", caps);
 }
@@ -5200,9 +5548,162 @@ static struct kobj_attribute lru_gen_enabled_attr = __ATTR(
 	enabled, 0644, show_enable, store_enable
 );
 
+static int print_node_mglru(struct lruvec *lruvec, char *buf, int orig_pos)
+{
+	unsigned long seq;
+	struct lru_gen_page *lrugen = &lruvec->lrugen;
+
+	DEFINE_MAX_SEQ(lruvec);
+	DEFINE_MIN_SEQ(lruvec);
+
+	int print_pos = orig_pos;
+
+	seq = min(min_seq[0], min_seq[1]);
+
+	for (; seq <= max_seq; seq++) {
+		int gen, type, zone;
+		unsigned int msecs;
+
+		gen = lru_gen_from_seq(seq);
+		msecs = jiffies_to_msecs(jiffies - READ_ONCE(lrugen->timestamps[gen]));
+
+		print_pos += snprintf(buf + print_pos, PAGE_SIZE - print_pos,
+			" %10lu %10u", seq, msecs);
+
+		for (type = 0; type < ANON_AND_FILE; type++) {
+			long size = 0;
+
+			if (seq < min_seq[type]) {
+				print_pos += snprintf(buf + print_pos,
+					PAGE_SIZE - print_pos, "         -0 ");
+				continue;
+			}
+
+			for (zone = 0; zone < MAX_NR_ZONES; zone++)
+				size += READ_ONCE(lrugen->nr_pages[gen][type][zone]);
+
+			print_pos += snprintf(buf + print_pos,
+				PAGE_SIZE - print_pos, " %10lu ", max(size, 0L));
+		}
+
+		print_pos += snprintf(buf + print_pos, PAGE_SIZE - print_pos, "\n");
+
+	}
+
+	return print_pos - orig_pos;
+}
+
+static ssize_t show_lru_gen_admin(struct kobject *kobj, struct kobj_attribute *attr, char *buf)
+{
+	struct lruvec *lruvec;
+	struct mem_cgroup *memcg;
+
+	char *path = kvmalloc(PATH_MAX, GFP_KERNEL);
+	int buf_len = 0;
+
+	if (!path)
+		return -EINVAL;
+	path[0] = 0;
+	buf[0] = 0;
+	memcg = mem_cgroup_iter(NULL, NULL, NULL);
+	do {
+		int nid;
+
+		for_each_node_state(nid, N_MEMORY) {
+			lruvec = mem_cgroup_lruvec(memcg, NODE_DATA(nid));
+			if (lruvec) {
+				if (nid == first_memory_node) {
+#ifdef CONFIG_MEMCG
+					if (memcg)
+						cgroup_path(memcg->css.cgroup, path, PATH_MAX);
+					else
+						path[0] = 0;
+#endif
+					buf_len += snprintf(buf + buf_len, PAGE_SIZE - buf_len,
+						"memcg %5hu %s\n", mem_cgroup_id(memcg), path);
+				}
+
+				buf_len += snprintf(buf + buf_len, PAGE_SIZE - buf_len,
+					" node %5d\n", nid);
+				buf_len += print_node_mglru(lruvec, buf, buf_len);
+			}
+		}
+	} while ((memcg = mem_cgroup_iter(NULL, memcg, NULL)));
+
+	if (buf_len >= PAGE_SIZE)
+		buf_len = PAGE_SIZE - 1;
+	buf[buf_len] = 0;
+
+	kvfree(path);
+
+	return buf_len;
+}
+
+static ssize_t store_lru_gen_admin(struct kobject *kobj, struct kobj_attribute *attr,
+				const char *src, size_t len)
+{
+	void *buf;
+	char *cur, *next;
+	int err = 0;
+	struct scan_control sc = {
+		.may_writepage = true,
+		.may_unmap = true,
+		.may_swap = true,
+		.reclaim_idx = MAX_NR_ZONES - 1,
+		.gfp_mask = GFP_KERNEL,
+	};
+
+	buf = kvmalloc(len + 1, GFP_USER);
+	if (!buf)
+		return -ENOMEM;
+
+	memcpy(buf, src, len);
+
+	next = buf;
+	next[len] = '\0';
+
+	set_task_reclaim_state(current, &sc.reclaim_state);
+
+	while ((cur = strsep(&next, ",;\n"))) {
+		int n;
+		int end;
+		char cmd;
+		unsigned int memcg_id;
+		unsigned int nid;
+		unsigned long seq;
+		unsigned int swappiness = -1;
+		unsigned long nr_to_reclaim = -1;
+
+		cur = skip_spaces(cur);
+		if (!*cur)
+			continue;
+
+		n = sscanf(cur, "%c %u %u %lu %n %u %n %lu %n", &cmd, &memcg_id, &nid,
+			   &seq, &end, &swappiness, &end, &nr_to_reclaim, &end);
+		if (n < 4 || cur[end]) {
+			err = -EINVAL;
+			break;
+		}
+
+		err = run_cmd(cmd, memcg_id, nid, seq, &sc, swappiness, nr_to_reclaim);
+		if (err)
+			break;
+	}
+
+	set_task_reclaim_state(current, NULL);
+	kvfree(buf);
+
+	return err ? : len;
+}
+
+static struct kobj_attribute lru_gen_admin_attr = __ATTR(
+	admin, 0644, show_lru_gen_admin, store_lru_gen_admin
+);
+
 static struct attribute *lru_gen_attrs[] = {
 	&lru_gen_min_ttl_attr.attr,
 	&lru_gen_enabled_attr.attr,
+	&lru_gen_admin_attr.attr,
 	NULL
 };
 
@@ -5272,7 +5773,7 @@ static void lru_gen_seq_show_full(struct seq_file *m, struct lruvec *lruvec,
 	int i;
 	int type, tier;
 	int hist = lru_hist_from_seq(seq);
-	struct lru_gen_struct *lrugen = &lruvec->lrugen;
+	struct lru_gen_page *lrugen = &lruvec->lrugen;
 
 	for (tier = 0; tier < MAX_NR_TIERS; tier++) {
 		seq_printf(m, "            %10d", tier);
@@ -5316,7 +5817,7 @@ static int lru_gen_seq_show(struct seq_file *m, void *v)
 	unsigned long seq;
 	bool full = !debugfs_real_fops(m->file)->write;
 	struct lruvec *lruvec = v;
-	struct lru_gen_struct *lrugen = &lruvec->lrugen;
+	struct lru_gen_page *lrugen = &lruvec->lrugen;
 	int nid = lruvec_pgdat(lruvec)->node_id;
 	struct mem_cgroup *memcg = lruvec_memcg(lruvec);
 	DEFINE_MAX_SEQ(lruvec);
@@ -5402,11 +5903,14 @@ static int run_eviction(struct lruvec *lruvec, unsigned long seq, struct scan_co
 	while (!signal_pending(current)) {
 		DEFINE_MIN_SEQ(lruvec);
 
-		if (seq < min_seq[!swappiness] || sc->nr_reclaimed >= nr_to_reclaim ||
-		    !evict_pages(lruvec, sc, swappiness, NULL)) {
-			err = 0;
-			break;
-		}
+		if (seq < min_seq[!swappiness])
+			return 0;
+
+		if (sc->nr_reclaimed >= nr_to_reclaim)
+			return 0;
+
+		if (!evict_pages(lruvec, sc, swappiness))
+			return 0;
 
 		cond_resched();
 	}
@@ -5425,11 +5929,11 @@ static int run_cmd(char cmd, int memcg_id, int nid, unsigned long seq,
 
 	if (!mem_cgroup_disabled()) {
 		rcu_read_lock();
+
 		memcg = mem_cgroup_from_id(memcg_id);
-#ifdef CONFIG_MEMCG
-		if (memcg && !css_tryget(&memcg->css))
+		if (!mem_cgroup_tryget(memcg))
 			memcg = NULL;
-#endif
+
 		rcu_read_unlock();
 
 		if (!memcg)
@@ -5484,6 +5988,14 @@ static ssize_t lru_gen_seq_write(struct file *file, const char __user *src,
 	if (copy_from_user(buf, src, len)) {
 		kvfree(buf);
 		return -EFAULT;
+	}
+
+	set_task_reclaim_state(current, &sc.reclaim_state);
+	flags = memalloc_noreclaim_save();
+	blk_start_plug(&plug);
+	if (!set_mm_walk(NULL, true)) {
+		err = -ENOMEM;
+		goto done;
 	}
 
 	next = buf;
@@ -5561,7 +6073,7 @@ void lru_gen_init_lruvec(struct lruvec *lruvec)
 {
 	int i;
 	int gen, type, zone;
-	struct lru_gen_struct *lrugen = &lruvec->lrugen;
+	struct lru_gen_page *lrugen = &lruvec->lrugen;
 
 	lrugen->max_seq = MIN_NR_GENS + 1;
 	lrugen->enabled = lru_gen_enabled();
@@ -5570,13 +6082,26 @@ void lru_gen_init_lruvec(struct lruvec *lruvec)
 		lrugen->timestamps[i] = jiffies;
 
 	for_each_gen_type_zone(gen, type, zone)
-		INIT_LIST_HEAD(&lrugen->lists[gen][type][zone]);
+		INIT_LIST_HEAD(&lrugen->pages[gen][type][zone]);
 
 	lruvec->mm_state.seq = MIN_NR_GENS;
 	init_waitqueue_head(&lruvec->mm_state.wait);
 }
 
 #ifdef CONFIG_MEMCG
+
+void lru_gen_init_pgdat(struct pglist_data *pgdat)
+{
+	int i, j;
+
+	spin_lock_init(&pgdat->memcg_lru.lock);
+
+	for (i = 0; i < MEMCG_NR_GENS; i++) {
+		for (j = 0; j < MEMCG_NR_BINS; j++)
+			INIT_HLIST_NULLS_HEAD(&pgdat->memcg_lru.fifo[i][j], i);
+	}
+}
+
 void lru_gen_init_memcg(struct mem_cgroup *memcg)
 {
 	INIT_LIST_HEAD(&memcg->mm_list.fifo);
@@ -5600,16 +6125,81 @@ void lru_gen_exit_memcg(struct mem_cgroup *memcg)
 		}
 	}
 }
-#endif
+
+void lru_gen_online_memcg(struct mem_cgroup *memcg)
+{
+	int gen;
+	int nid;
+	int bin = prandom_u32_max(MEMCG_NR_BINS);
+
+	for_each_node(nid) {
+		struct pglist_data *pgdat = NODE_DATA(nid);
+		struct lruvec *lruvec = get_lruvec(memcg, nid);
+
+		spin_lock(&pgdat->memcg_lru.lock);
+
+		VM_WARN_ON_ONCE(!hlist_nulls_unhashed(&lruvec->lrugen.list));
+
+		gen = get_memcg_gen(pgdat->memcg_lru.seq);
+
+		hlist_nulls_add_tail_rcu(&lruvec->lrugen.list, &pgdat->memcg_lru.fifo[gen][bin]);
+		pgdat->memcg_lru.nr_memcgs[gen]++;
+
+		lruvec->lrugen.gen = gen;
+
+		spin_unlock(&pgdat->memcg_lru.lock);
+	}
+}
+
+void lru_gen_offline_memcg(struct mem_cgroup *memcg)
+{
+	int nid;
+
+	for_each_node(nid) {
+		struct lruvec *lruvec = get_lruvec(memcg, nid);
+
+		lru_gen_rotate_memcg(lruvec, MEMCG_LRU_OLD);
+	}
+}
+
+void lru_gen_release_memcg(struct mem_cgroup *memcg)
+{
+	int gen;
+	int nid;
+
+	for_each_node(nid) {
+		struct pglist_data *pgdat = NODE_DATA(nid);
+		struct lruvec *lruvec = get_lruvec(memcg, nid);
+
+		spin_lock(&pgdat->memcg_lru.lock);
+
+		VM_WARN_ON_ONCE(hlist_nulls_unhashed(&lruvec->lrugen.list));
+
+		gen = lruvec->lrugen.gen;
+
+		hlist_nulls_del_rcu(&lruvec->lrugen.list);
+		pgdat->memcg_lru.nr_memcgs[gen]--;
+
+		if (!pgdat->memcg_lru.nr_memcgs[gen] && gen == get_memcg_gen(pgdat->memcg_lru.seq))
+			WRITE_ONCE(pgdat->memcg_lru.seq, pgdat->memcg_lru.seq + 1);
+
+		spin_unlock(&pgdat->memcg_lru.lock);
+	}
+}
+
+#endif /* CONFIG_MEMCG */
 
 static int __init init_lru_gen(void)
 {
+	struct kernfs_node *tmp;
 	BUILD_BUG_ON(MIN_NR_GENS + 1 >= MAX_NR_GENS);
 	BUILD_BUG_ON(BIT(LRU_GEN_WIDTH) <= MAX_NR_GENS);
 	BUILD_BUG_ON(sizeof(MM_STAT_CODES) != NR_MM_STATS + 1);
 
 	if (sysfs_create_group(mm_kobj, &lru_gen_attr_group))
 		pr_err("lru_gen: failed to create sysfs group\n");
+	tmp = kernfs_find_and_get(mm_kobj->sd, "lru_gen");
+	lru_gen_admin_node = kernfs_find_and_get(tmp, "admin");
 
 	debugfs_create_file("lru_gen", 0644, NULL, NULL, &lru_gen_rw_fops);
 	debugfs_create_file("lru_gen_full", 0444, NULL, NULL, &lru_gen_ro_fops);
@@ -5628,6 +6218,10 @@ static void lru_gen_shrink_lruvec(struct lruvec *lruvec, struct scan_control *sc
 {
 }
 
+static void lru_gen_shrink_node(struct pglist_data *pgdat, struct scan_control *sc)
+{
+}
+
 #endif /* CONFIG_LRU_GEN */
 
 static void shrink_lruvec(struct lruvec *lruvec, struct scan_control *sc)
@@ -5638,10 +6232,10 @@ static void shrink_lruvec(struct lruvec *lruvec, struct scan_control *sc)
 	enum lru_list lru;
 	unsigned long nr_reclaimed = 0;
 	unsigned long nr_to_reclaim = sc->nr_to_reclaim;
+	bool proportional_reclaim;
 	struct blk_plug plug;
-	bool scan_adjusted;
 
-	if (lru_gen_enabled()) {
+	if (lru_gen_enabled() && !global_reclaim(sc)) {
 		lru_gen_shrink_lruvec(lruvec, sc);
 		return;
 	}
@@ -5662,8 +6256,8 @@ static void shrink_lruvec(struct lruvec *lruvec, struct scan_control *sc)
 	 * abort proportional reclaim if either the file or anon lru has already
 	 * dropped to zero at the first pass.
 	 */
-	scan_adjusted = (!cgroup_reclaim(sc) && !current_is_kswapd() &&
-			 sc->priority == DEF_PRIORITY);
+	proportional_reclaim = (!cgroup_reclaim(sc) && !current_is_kswapd() &&
+				sc->priority == DEF_PRIORITY);
 
 	blk_start_plug(&plug);
 	while (nr[LRU_INACTIVE_ANON] || nr[LRU_ACTIVE_FILE] ||
@@ -5683,7 +6277,7 @@ static void shrink_lruvec(struct lruvec *lruvec, struct scan_control *sc)
 
 		cond_resched();
 
-		if (nr_reclaimed < nr_to_reclaim || scan_adjusted)
+		if (nr_reclaimed < nr_to_reclaim || proportional_reclaim)
 			continue;
 
 		/*
@@ -5734,8 +6328,6 @@ static void shrink_lruvec(struct lruvec *lruvec, struct scan_control *sc)
 		nr_scanned = targets[lru] - nr[lru];
 		nr[lru] = targets[lru] * (100 - percentage) / 100;
 		nr[lru] -= min(nr[lru], nr_scanned);
-
-		scan_adjusted = true;
 	}
 	blk_finish_plug(&plug);
 	sc->nr_reclaimed += nr_reclaimed;
@@ -5889,6 +6481,11 @@ static void shrink_node(pg_data_t *pgdat, struct scan_control *sc)
 	unsigned long nr_reclaimed, nr_scanned;
 	struct lruvec *target_lruvec;
 	bool reclaimable = false;
+
+	if (lru_gen_enabled() && global_reclaim(sc)) {
+		lru_gen_shrink_node(pgdat, sc);
+		return;
+	}
 
 	target_lruvec = mem_cgroup_lruvec(sc->target_mem_cgroup, pgdat);
 

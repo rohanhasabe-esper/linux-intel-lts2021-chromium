@@ -110,6 +110,18 @@ static inline bool lru_gen_in_fault(void)
 	return current->in_lru_fault;
 }
 
+#ifdef CONFIG_MEMCG
+static inline int lru_gen_memcg_seg(struct lruvec *lruvec)
+{
+	return READ_ONCE(lruvec->lrugen.seg);
+}
+#else
+static inline int lru_gen_memcg_seg(struct lruvec *lruvec)
+{
+	return 0;
+}
+#endif
+
 static inline int lru_gen_from_seq(unsigned long seq)
 {
 	return seq % MAX_NR_GENS;
@@ -145,7 +157,7 @@ static inline void lru_gen_update_size(struct lruvec *lruvec, struct page *page,
 	int zone = page_zonenum(page);
 	int delta = thp_nr_pages(page);
 	enum lru_list lru = type * LRU_INACTIVE_FILE;
-	struct lru_gen_struct *lrugen = &lruvec->lrugen;
+	struct lru_gen_page *lrugen = &lruvec->lrugen;
 
 	VM_BUG_ON(old_gen != -1 && old_gen >= MAX_NR_GENS);
 	VM_BUG_ON(new_gen != -1 && new_gen >= MAX_NR_GENS);
@@ -190,7 +202,7 @@ static inline bool lru_gen_add_page(struct lruvec *lruvec, struct page *page, bo
 	unsigned long old_flags, new_flags;
 	int type = page_is_file_lru(page);
 	int zone = page_zonenum(page);
-	struct lru_gen_struct *lrugen = &lruvec->lrugen;
+	struct lru_gen_page *lrugen = &lruvec->lrugen;
 
 	if (PageUnevictable(page) || !lrugen->enabled)
 		return false;
@@ -223,9 +235,9 @@ static inline bool lru_gen_add_page(struct lruvec *lruvec, struct page *page, bo
 	lru_gen_update_size(lruvec, page, -1, gen);
 	/* for rotate_reclaimable_page() */
 	if (reclaiming)
-		list_add_tail(&page->lru, &lrugen->lists[gen][type][zone]);
+		list_add_tail(&page->lru, &lrugen->pages[gen][type][zone]);
 	else
-		list_add(&page->lru, &lrugen->lists[gen][type][zone]);
+		list_add(&page->lru, &lrugen->pages[gen][type][zone]);
 
 	return true;
 }
@@ -271,6 +283,11 @@ static inline bool lru_gen_enabled(void)
 static inline bool lru_gen_in_fault(void)
 {
 	return false;
+}
+
+static inline int lru_gen_memcg_seg(struct lruvec *lruvec)
+{
+	return 0;
 }
 
 static inline bool lru_gen_add_page(struct lruvec *lruvec, struct page *page, bool reclaiming)
@@ -407,5 +424,16 @@ static inline bool anon_vma_name_eq(struct anon_vma_name *anon_name1,
 }
 
 #endif  /* CONFIG_ANON_VMA_NAME */
+
+static inline bool vma_has_recency(struct vm_area_struct *vma)
+{
+	if (vma->vm_flags & (VM_SEQ_READ | VM_RAND_READ))
+		return false;
+
+	if (vma->vm_file && (vma->vm_file->f_mode & FMODE_NOREUSE))
+		return false;
+
+	return true;
+}
 
 #endif

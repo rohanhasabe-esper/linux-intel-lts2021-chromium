@@ -417,6 +417,10 @@
 	status = "okay";
 };
 
+&gic {
+	mediatek,broken-save-restore-fw;
+};
+
 &gpu {
 	supply-names = "mali","sram";
 	mali-supply = <&mt6366_vgpu_reg>;
@@ -1875,6 +1879,7 @@
 &scp {
 	status = "okay";
 
+	firmware-name = "mediatek/mt8186/scp.img";
 	memory-region = <&scp_mem_reserved>;
 	pinctrl-names = "default";
 	pinctrl-0 = <&scp_pins>;
@@ -2042,6 +2047,10 @@
 
 &uart0 {
 	status = "okay";
+};
+
+&watchdog {
+	mediatek,reset-by-toprgu;
 };
 
 &xhci0 {

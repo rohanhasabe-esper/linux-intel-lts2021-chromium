@@ -20,6 +20,7 @@
 #include "intel_gsc.h"
 
 #include "i915_vma.h"
+#include "i915_perf_types.h"
 #include "intel_engine_types.h"
 #include "intel_gt_buffer_pool_types.h"
 #include "intel_hwconfig.h"
@@ -59,6 +60,9 @@ enum intel_steering_type {
 	L3BANK,
 	MSLICE,
 	LNCF,
+	GAM,
+	DSS,
+	OADDRM,
 
 	/*
 	 * On some platforms there are multiple types of MCR registers that
@@ -76,8 +80,22 @@ enum intel_submission_method {
 	INTEL_SUBMISSION_GUC,
 };
 
+struct gt_defaults {
+	u32 min_freq;
+	u32 max_freq;
+};
+
+enum intel_gt_type {
+	GT_PRIMARY,
+	GT_TILE,
+	GT_MEDIA,
+};
+
 struct intel_gt {
 	struct drm_i915_private *i915;
+	const char *name;
+	enum intel_gt_type type;
+
 	struct intel_uncore *uncore;
 	struct i915_ggtt *ggtt;
 
@@ -127,6 +145,20 @@ struct intel_gt {
 	struct intel_wakeref wakeref;
 	atomic_t user_wakeref;
 
+	/**
+	 *  Protects access to lmem usefault list.
+	 *  It is required, if we are outside of the runtime suspend path,
+	 *  access to @lmem_userfault_list requires always first grabbing the
+	 *  runtime pm, to ensure we can't race against runtime suspend.
+	 *  Once we have that we also need to grab @lmem_userfault_lock,
+	 *  at which point we have exclusive access.
+	 *  The runtime suspend path is special since it doesn't really hold any locks,
+	 *  but instead has exclusive access by virtue of all other accesses requiring
+	 *  holding the runtime pm wakeref.
+	 */
+	struct mutex lmem_userfault_lock;
+	struct list_head lmem_userfault_list;
+
 	struct list_head closed_vma;
 	spinlock_t closed_lock; /* guards the list of closed_vma */
 
@@ -142,6 +174,9 @@ struct intel_gt {
 	 */
 	intel_wakeref_t awake;
 
+	/* Manual runtime pm autosuspend delay for user GGTT/lmem mmaps */
+	struct intel_wakeref_auto userfault_wakeref;
+
 	u32 clock_frequency;
 	u32 clock_period_ns;
 
@@ -149,7 +184,7 @@ struct intel_gt {
 	struct intel_rc6 rc6;
 	struct intel_rps rps;
 
-	spinlock_t irq_lock;
+	spinlock_t *irq_lock;
 	u32 gt_imr;
 	u32 pm_ier;
 	u32 pm_imr;
@@ -251,6 +286,20 @@ struct intel_gt {
 
 	/* gt/gtN sysfs */
 	struct kobject sysfs_gt;
+
+	/* sysfs defaults per gt */
+	struct gt_defaults defaults;
+	struct kobject *sysfs_defaults;
+
+	struct i915_perf_gt perf;
+};
+
+struct intel_gt_definition {
+	enum intel_gt_type type;
+	char *name;
+	u32 mapping_base;
+	u32 gsi_offset;
+	intel_engine_mask_t engine_mask;
 };
 
 enum intel_gt_scratch_field {

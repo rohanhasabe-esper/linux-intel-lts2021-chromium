@@ -1405,7 +1405,6 @@ static void anx7625_stop_dp_work(struct anx7625_data *ctx)
 {
 	ctx->hpd_status = 0;
 	ctx->hpd_high_cnt = 0;
-	ctx->display_timing_valid = 0;
 }
 
 static void anx7625_start_dp_work(struct anx7625_data *ctx)
@@ -1658,6 +1657,7 @@ static int anx7625_parse_dt(struct device *dev,
 	anx7625_get_swing_setting(dev, pdata);
 
 	pdata->is_dpi = 0; /* default dsi mode */
+	of_node_put(pdata->mipi_host_node);
 	pdata->mipi_host_node = of_graph_get_remote_node(np, 0, 0);
 	if (!pdata->mipi_host_node) {
 		DRM_DEV_ERROR(dev, "fail to get internal panel.\n");

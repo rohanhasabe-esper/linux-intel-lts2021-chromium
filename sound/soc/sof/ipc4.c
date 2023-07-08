@@ -205,6 +205,11 @@ static void sof_ipc4_log_header(struct device *dev, u8 *text, struct sof_ipc4_ms
 			/* Notification message */
 			u32 notif = SOF_IPC4_NOTIFICATION_TYPE_GET(msg->primary);
 
+			/* Do not print log buffer notification if not desired */
+			if (notif == SOF_IPC4_NOTIFY_LOG_BUFFER_STATUS &&
+			    !sof_debug_check_flag(SOF_DBG_PRINT_DMA_POSITION_UPDATE_LOGS))
+				return;
+
 			if (notif < SOF_IPC4_NOTIFY_TYPE_LAST)
 				str2 = ipc4_dbg_notification_type[notif];
 			if (!str2)
@@ -234,6 +239,13 @@ static void sof_ipc4_log_header(struct device *dev, u8 *text, struct sof_ipc4_ms
 static void sof_ipc4_log_header(struct device *dev, u8 *text, struct sof_ipc4_msg *msg,
 				bool data_size_valid)
 {
+	/* Do not print log buffer notification if not desired */
+	if (!sof_debug_check_flag(SOF_DBG_PRINT_DMA_POSITION_UPDATE_LOGS) &&
+	    !SOF_IPC4_MSG_IS_MODULE_MSG(msg->primary) &&
+	    SOF_IPC4_MSG_TYPE_GET(msg->primary) == SOF_IPC4_GLB_NOTIFICATION &&
+	    SOF_IPC4_NOTIFICATION_TYPE_GET(msg->primary) == SOF_IPC4_NOTIFY_LOG_BUFFER_STATUS)
+		return;
+
 	if (data_size_valid && msg->data_size)
 		dev_dbg(dev, "%s: %#x|%#x [data size: %zu]\n", text,
 			msg->primary, msg->extension, msg->data_size);
@@ -283,6 +295,7 @@ static int ipc4_wait_tx_done(struct snd_sof_ipc *ipc, void *reply_data)
 	if (ret == 0) {
 		dev_err(sdev->dev, "ipc timed out for %#x|%#x\n",
 			ipc4_msg->primary, ipc4_msg->extension);
+		snd_sof_handle_fw_exception(ipc->sdev, "IPC timeout");
 		return -ETIMEDOUT;
 	}
 
@@ -379,6 +392,9 @@ static int sof_ipc4_tx_msg(struct snd_sof_dev *sdev, void *msg_data, size_t msg_
 static int sof_ipc4_set_get_data(struct snd_sof_dev *sdev, void *data,
 				 size_t payload_bytes, bool set)
 {
+	const struct sof_dsp_power_state target_state = {
+			.state = SOF_DSP_PM_D0,
+	};
 	size_t payload_limit = sdev->ipc->max_payload_size;
 	struct sof_ipc4_msg *ipc4_msg = data;
 	struct sof_ipc4_msg tx = {{ 0 }};
@@ -408,6 +424,11 @@ static int sof_ipc4_set_get_data(struct snd_sof_dev *sdev, void *data,
 	tx.extension |= SOF_IPC4_MOD_EXT_MSG_SIZE(payload_bytes);
 
 	tx.extension |= SOF_IPC4_MOD_EXT_MSG_FIRST_BLOCK(1);
+
+	/* ensure the DSP is in D0i0 before sending IPC */
+	ret = snd_sof_dsp_set_power_state(sdev, &target_state);
+	if (ret < 0)
+		return ret;
 
 	/* Serialise IPC TX */
 	mutex_lock(&sdev->ipc->tx_mutex);
@@ -525,7 +546,7 @@ static int ipc4_fw_ready(struct snd_sof_dev *sdev, struct sof_ipc4_msg *ipc4_msg
 		return inbox_offset;
 	}
 	inbox_size = SOF_IPC4_MSG_MAX_SIZE;
-	outbox_offset = snd_sof_dsp_get_window_offset(sdev, 1);
+	outbox_offset = snd_sof_dsp_get_window_offset(sdev, SOF_IPC4_OUTBOX_WINDOW_IDX);
 	outbox_size = SOF_IPC4_MSG_MAX_SIZE;
 
 	sdev->dsp_box.offset = inbox_offset;
@@ -533,10 +554,14 @@ static int ipc4_fw_ready(struct snd_sof_dev *sdev, struct sof_ipc4_msg *ipc4_msg
 	sdev->host_box.offset = outbox_offset;
 	sdev->host_box.size = outbox_size;
 
+	sdev->debug_box.offset = snd_sof_dsp_get_window_offset(sdev,
+							SOF_IPC4_DEBUG_WINDOW_IDX);
+
 	dev_dbg(sdev->dev, "mailbox upstream 0x%x - size 0x%x\n",
 		inbox_offset, inbox_size);
 	dev_dbg(sdev->dev, "mailbox downstream 0x%x - size 0x%x\n",
 		outbox_offset, outbox_size);
+	dev_dbg(sdev->dev, "debug box 0x%x\n", sdev->debug_box.offset);
 
 	return sof_ipc4_init_msg_memory(sdev);
 }
@@ -572,6 +597,9 @@ static void sof_ipc4_rx_msg(struct snd_sof_dev *sdev)
 		break;
 	case SOF_IPC4_NOTIFY_RESOURCE_EVENT:
 		data_size = sizeof(struct sof_ipc4_notify_resource_data);
+		break;
+	case SOF_IPC4_NOTIFY_LOG_BUFFER_STATUS:
+		sof_ipc4_mtrace_update_pos(sdev, SOF_IPC4_LOG_CORE_GET(ipc4_msg->primary));
 		break;
 	default:
 		dev_dbg(sdev->dev, "Unhandled DSP message: %#x|%#x\n",
@@ -646,4 +674,5 @@ const struct sof_ipc_ops ipc4_ops = {
 	.fw_loader = &ipc4_loader_ops,
 	.tplg = &ipc4_tplg_ops,
 	.pcm = &ipc4_pcm_ops,
+	.fw_tracing = &ipc4_mtrace_ops,
 };

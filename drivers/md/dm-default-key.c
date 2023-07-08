@@ -70,10 +70,7 @@ static void default_key_dtr(struct dm_target *ti)
 	int err;
 
 	if (dkc->dev) {
-		err = blk_crypto_evict_key(bdev_get_queue(dkc->dev->bdev),
-					   &dkc->key);
-		if (err && err != -ENOKEY)
-			DMWARN("Failed to evict crypto key: %d", err);
+		blk_crypto_evict_key(bdev_get_queue(dkc->dev->bdev), &dkc->key);
 		dm_put_device(ti, dkc->dev);
 	}
 	kfree_sensitive(dkc->cipher_string);

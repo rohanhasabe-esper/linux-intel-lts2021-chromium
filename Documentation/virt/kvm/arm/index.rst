@@ -13,3 +13,6 @@ ARM
    ptp_kvm
    mmio-guard
    uclamp
+   get_cur_cpufreq
+   util_hint
+   get_freqtbl

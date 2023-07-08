@@ -96,6 +96,8 @@
 		regulator-min-microvolt = <3300000>;
 		regulator-max-microvolt = <3300000>;
 		enable-active-high;
+		regulator-boot-on;
+		off-on-delay-us = <500000>;
 		gpio = <&pio 41 GPIO_ACTIVE_HIGH>;
 		pinctrl-names = "default";
 		pinctrl-0 = <&panel_fixed_pins>;
@@ -137,15 +139,53 @@
 		};
 	};
 
+	hdmi_mux: hdmi_mux {
+		compatible = "gpio-display-mux";
+		status = "okay";
+		detect-gpios = <&pio 36 GPIO_ACTIVE_HIGH>;
+		pinctrl-names = "default";
+		pinctrl-0 = <&hdmi_mux_pins>;
+		ddc-i2c-bus = <&hdmiddc0>;
+
+		ports {
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			port@0 { /* input */
+				reg = <0>;
+
+				hdmi_mux_in: endpoint {
+					remote-endpoint = <&hdmi0_out>;
+				};
+			};
+
+			port@1 { /* output */
+				reg = <1>;
+
+				#address-cells = <1>;
+				#size-cells = <0>;
+
+				hdmi_mux_out_anx: endpoint@0 {
+					reg = <0>;
+					remote-endpoint = <&anx7688_in>;
+				};
+
+				hdmi_mux_out_hdmi: endpoint@1 {
+					reg = <1>;
+					remote-endpoint = <&hdmi_connector_in>;
+				};
+			};
+		};
+	};
+
 	hdmicon: connector {
 		compatible = "hdmi-connector";
 		label = "hdmi";
 		type = "a";
-		ddc-i2c-bus = <&hdmiddc0>;
 
 		port {
 			hdmi_connector_in: endpoint {
-				remote-endpoint = <&hdmi0_out>;
+				remote-endpoint = <&hdmi_mux_out_hdmi>;
 			};
 		};
 	};
@@ -229,7 +269,7 @@
 			reg = <1>;
 
 			hdmi0_out: endpoint {
-				remote-endpoint = <&hdmi_connector_in>;
+				remote-endpoint = <&hdmi_mux_in>;
 			};
 		};
 	};
@@ -289,7 +329,7 @@
 		};
 
 		aux-bus {
-			panel {
+			panel: panel {
 				compatible = "edp-panel";
 				power-supply = <&panel_fixed_3v3>;
 				backlight = <&backlight>;
@@ -1171,6 +1211,25 @@
 				reg = <0xb>;
 				sbs,i2c-retry-count = <2>;
 				sbs,poll-retry-count = <1>;
+			};
+		};
+
+		i2c_tunnel_b: i2c-tunnel@1 {
+			compatible = "google,cros-ec-i2c-tunnel";
+			google,remote-bus = <1>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			anx7688: anx7688@2c {
+				compatible = "google,cros-ec-anx7688";
+				status = "okay";
+				reg = <0x2c>;
+
+				port {
+					anx7688_in: endpoint {
+						remote-endpoint = <&hdmi_mux_out_anx>;
+					};
+				};
 			};
 		};
 	};

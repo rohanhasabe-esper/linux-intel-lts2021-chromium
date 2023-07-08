@@ -1245,8 +1245,10 @@ static int cam_smmu_map_to_pool(struct iommu_domain *domain,
 	 * iommu_map_sgtable() will map the entire sgtable, even if
 	 * the assumed buffer size is smaller. Use the real buffer size
 	 * for IOVA space allocation to take care of this.
+	 *
+	 * For allocations in CAM_SMMU_REGION_SHARED region the size is zero.
 	 */
-	WARN_ON_ONCE(buffer_size > *size);
+	WARN_ON_ONCE(*size && buffer_size > *size);
 
 	*iova = gen_pool_alloc(pool, buffer_size);
 	if (!*iova)
@@ -1316,7 +1318,7 @@ static int cam_smmu_map_buffer_validate(struct dma_buf *buf,
 		return rc;
 	}
 
-	attach = dma_buf_attach(buf, cb->dev);
+	attach = dma_buf_attach(buf, cb->dev->parent);
 	if (IS_ERR_OR_NULL(attach)) {
 		rc = PTR_ERR(attach);
 		CAM_ERR(CAM_SMMU, "Error: dma buf attach failed");
@@ -2211,6 +2213,8 @@ static int cam_alloc_smmu_context_banks(struct device *dev)
 
 	cam_smmu_reset_iommu_table(CAM_SMMU_TABLE_INIT);
 	iommu_cb_set.cb_init_count = 0;
+	dma_set_mask(dev, DMA_BIT_MASK(64));
+	dma_set_max_seg_size(dev, UINT_MAX);
 
 	CAM_DBG(CAM_SMMU, "no of context banks :%d", iommu_cb_set.cb_num);
 	return 0;
@@ -2443,6 +2447,7 @@ static int cam_smmu_probe(struct platform_device *pdev)
 		icp_fw.pages = NULL;
 		icp_fw.num_pages = 0;
 		dma_set_mask_and_coherent(dev, DMA_BIT_MASK(64));
+		dma_set_max_seg_size(dev, UINT_MAX);
 		return rc;
 	}
 

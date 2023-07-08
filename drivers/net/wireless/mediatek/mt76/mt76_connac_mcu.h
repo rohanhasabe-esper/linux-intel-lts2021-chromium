@@ -354,6 +354,16 @@ struct sta_rec_he {
 	u8 rsv2[2];
 } __packed;
 
+struct sta_rec_he_v2 {
+	__le16 tag;
+	__le16 len;
+	u8 he_mac_cap[6];
+	u8 he_phy_cap[11];
+	u8 pkt_ext;
+	/* 0: BW80, 1: BW160, 2: BW8080 */
+	__le16 max_nss_mcs[CMD_HE_MCS_BW_NUM];
+} __packed;
+
 struct sta_rec_amsdu {
 	__le16 tag;
 	__le16 len;
@@ -779,6 +789,7 @@ enum {
 	STA_REC_BFEE,
 	STA_REC_PHY = 0x15,
 	STA_REC_HE_6G = 0x17,
+	STA_REC_HE_V2 = 0x19,
 	STA_REC_MAX_NUM
 };
 
@@ -1172,6 +1183,7 @@ enum {
 	MCU_CE_CMD_TEST_CTRL = 0x01,
 	MCU_CE_CMD_START_HW_SCAN = 0x03,
 	MCU_CE_CMD_SET_PS_PROFILE = 0x05,
+	MCU_CE_CMD_SET_RX_FILTER = 0x0a,
 	MCU_CE_CMD_SET_CHAN_DOMAIN = 0x0f,
 	MCU_CE_CMD_SET_BSS_CONNECTED = 0x16,
 	MCU_CE_CMD_SET_BSS_ABORT = 0x17,

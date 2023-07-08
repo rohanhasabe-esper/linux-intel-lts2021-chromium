@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause
 /*
- * Copyright (C) 2012-2014, 2018-2022 Intel Corporation
+ * Copyright (C) 2012-2014, 2018-2023 Intel Corporation
  * Copyright (C) 2013-2015 Intel Mobile Communications GmbH
  * Copyright (C) 2016-2017 Intel Deutschland GmbH
  */
@@ -29,7 +29,7 @@ static int iwl_mvm_netlink_notifier(struct notifier_block *nb,
 
 	spin_lock_bh(&device_list_lock);
 	list_for_each_entry(mvm, &device_list, list) {
-		if (mvm->csi_portid == netlink_notify_portid(notify))
+		if (mvm->csi_portid == notify->portid)
 			mvm->csi_portid = 0;
 	}
 	spin_unlock_bh(&device_list_lock);
@@ -1018,12 +1018,13 @@ static int iwl_mvm_vendor_put_geo_profile(struct iwl_mvm *mvm, struct sk_buff *s
 		if (!nl_band)
 			return -ENOBUFS;
 
-		nla_put_u8(skb, IWL_VENDOR_SAR_GEO_MAX_TXP,
-			   mvm->fwrt.geo_profiles[profile - 1].bands[i].max);
-		nla_put_u8(skb, IWL_VENDOR_SAR_GEO_CHAIN_A_OFFSET,
-			   mvm->fwrt.geo_profiles[profile - 1].bands[i].chains[0]);
-		nla_put_u8(skb, IWL_VENDOR_SAR_GEO_CHAIN_B_OFFSET,
-			   mvm->fwrt.geo_profiles[profile - 1].bands[i].chains[1]);
+		if (nla_put_u8(skb, IWL_VENDOR_SAR_GEO_MAX_TXP,
+			       mvm->fwrt.geo_profiles[profile - 1].bands[i].max) ||
+		    nla_put_u8(skb, IWL_VENDOR_SAR_GEO_CHAIN_A_OFFSET,
+			       mvm->fwrt.geo_profiles[profile - 1].bands[i].chains[0]) ||
+		    nla_put_u8(skb, IWL_VENDOR_SAR_GEO_CHAIN_B_OFFSET,
+			       mvm->fwrt.geo_profiles[profile - 1].bands[i].chains[1]))
+			return -ENOBUFS;
 		nla_nest_end(skb, nl_band);
 	}
 	return 0;
@@ -1537,14 +1538,20 @@ static int iwl_mvm_vendor_add_pasn_sta(struct wiphy *wiphy,
 		return PTR_ERR(tb);
 
 	if (!tb[IWL_MVM_VENDOR_ATTR_ADDR] ||
-	    !tb[IWL_MVM_VENDOR_ATTR_STA_HLTK] ||
+	    (!tb[IWL_MVM_VENDOR_ATTR_STA_HLTK] &&
+	     !tb[IWL_MVM_VENDOR_ATTR_STA_TK]) ||
 	    !tb[IWL_MVM_VENDOR_ATTR_STA_CIPHER])
 		return -EINVAL;
 
 	addr = nla_data(tb[IWL_MVM_VENDOR_ATTR_ADDR]);
 	cipher = nla_get_u32(tb[IWL_MVM_VENDOR_ATTR_STA_CIPHER]);
-	hltk = nla_data(tb[IWL_MVM_VENDOR_ATTR_STA_HLTK]);
-	hltk_len = nla_len(tb[IWL_MVM_VENDOR_ATTR_STA_HLTK]);
+	if (tb[IWL_MVM_VENDOR_ATTR_STA_HLTK]) {
+		hltk = nla_data(tb[IWL_MVM_VENDOR_ATTR_STA_HLTK]);
+		hltk_len = nla_len(tb[IWL_MVM_VENDOR_ATTR_STA_HLTK]);
+	} else {
+		hltk = NULL;
+		hltk_len = 0;
+	}
 
 	rcu_read_lock();
 	sta = ieee80211_find_sta(vif, addr);
