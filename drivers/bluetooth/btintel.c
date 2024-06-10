@@ -2056,13 +2056,6 @@ download:
 	/* Start firmware downloading and get boot parameter */
 	err = btintel_download_firmware(hdev, ver, fw, boot_param);
 	if (err < 0) {
-		if (err == -EALREADY) {
-			/* Firmware has already been loaded */
-			btintel_set_flag(hdev, INTEL_FIRMWARE_LOADED);
-			err = 0;
-			goto done;
-		}
-
 		/* When FW download fails, send Intel Reset to retry
 		 * FW download.
 		 */
@@ -2248,13 +2241,6 @@ static int btintel_prepare_fw_download_tlv(struct hci_dev *hdev,
 					       INTEL_HW_VARIANT(ver->cnvi_bt),
 					       ver->sbe_type);
 	if (err < 0) {
-		if (err == -EALREADY) {
-			/* Firmware has already been loaded */
-			btintel_set_flag(hdev, INTEL_FIRMWARE_LOADED);
-			err = 0;
-			goto done;
-		}
-
 		/* When FW download fails, send Intel Reset to retry
 		 * FW download.
 		 */
